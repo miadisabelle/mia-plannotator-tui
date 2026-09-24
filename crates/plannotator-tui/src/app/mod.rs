@@ -470,6 +470,45 @@ impl App {
         self.scroll = (self.scroll as i64 + delta).clamp(0, max as i64) as usize;
     }
 
+    /// Page the document the way vim's ctrl+d / ctrl+u do: the selection moves as far as
+    /// the view, so the next block key continues from what is on screen. The mouse wheel
+    /// keeps `scroll_by`, which moves the view alone.
+    fn page_by(&mut self, delta: i64) {
+        if delta == 0 {
+            // A one-row pane pages by nothing; leave the selection where it is.
+            return;
+        }
+        let before = self.scroll;
+        self.scroll_by(delta);
+        if self.scroll == before {
+            // Already at an edge: select the edge block, as vim puts the cursor there.
+            let edge = if delta > 0 { self.open.doc.blocks.len().saturating_sub(1) } else { 0 };
+            self.select_block(edge);
+            return;
+        }
+        let blocks = &self.open.layout.blocks;
+        let Some(from) = blocks.get(self.selected).map(|b| b.first_row) else { return };
+        let height = usize::from(self.geometry.doc.height.max(1));
+        let view = self.scroll..self.scroll + height;
+        let target = (from as i64 + delta).clamp(view.start as i64, view.end as i64 - 1) as usize;
+        // The block that owns the target row, or the next one when the target is a gap row.
+        // A tall block that starts above the view still counts while any of it is on screen.
+        let on_screen = |b: &crate::layout::RenderedBlock| {
+            b.first_row < view.end && b.first_row + b.rows.len().max(1) > view.start
+        };
+        let owner = blocks.partition_point(|b| b.first_row <= target);
+        let block = match owner.checked_sub(1) {
+            Some(i) if blocks.get(i).is_some_and(|b| b.first_row + b.rows.len().max(1) > target) => i,
+            _ => owner,
+        };
+        if blocks.get(block).is_some_and(on_screen) {
+            let scroll = self.scroll;
+            self.select_block(block);
+            // select_block may nudge the view to fit a tall block; the page owns it here.
+            self.scroll = scroll;
+        }
+    }
+
     fn tree_len(&self) -> usize {
         self.tree.as_ref().map_or(0, |t| t.rows.len())
     }

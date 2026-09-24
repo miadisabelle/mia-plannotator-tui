@@ -210,8 +210,8 @@ impl App {
                 self.start_roaming();
                 self.motion_key(key);
             }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::PageDown, _) => self.scroll_by(page / 2),
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) | (KeyCode::PageUp, _) => self.scroll_by(-page / 2),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::PageDown, _) => self.page_by(page / 2),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) | (KeyCode::PageUp, _) => self.page_by(-page / 2),
             (KeyCode::Char('g') | KeyCode::Home, _) => self.select_block(0),
             (KeyCode::Char('G') | KeyCode::End, _) => {
                 self.select_block(self.open.doc.blocks.len().saturating_sub(1));
