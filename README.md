@@ -186,7 +186,7 @@ browser app writes, so both tools share one history. To turn it off, set
 
 ```sh
 plannotator-tui --export <file|folder>                          # all active notes, to stdout (no delivery recorded)
-plannotator-tui --annotate <file> <quote> <text> [comment|looks_good|delete]
+plannotator-tui --annotate <file> <quote> <text> [comment|looks_good|delete] [--occurrence N]
 plannotator-tui --snapshot <file|folder> [cols rows scroll] [quote]   # one frame as text
 plannotator-tui --bench <file>                                  # parse / layout timings
 ```

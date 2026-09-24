@@ -28,7 +28,7 @@ const USAGE: &str = "usage:
   plannotator-tui --export <file.md>
   plannotator-tui --bench <file.md>
   plannotator-tui --blocks <file.md>
-  plannotator-tui --annotate <file.md> <quote> <text> [comment|looks_good|delete]
+  plannotator-tui --annotate <file.md> <quote> <text> [comment|looks_good|delete] [--occurrence N]
   plannotator-tui --annotate-block <file.md> <block> <text>
   plannotator-tui --snapshot <file.md> [cols rows scroll] [select-quote] [menu]
   plannotator-tui config
@@ -83,6 +83,29 @@ fn parse_kind(s: Option<&str>) -> Kind {
     }
 }
 
+/// What follows `--annotate <file> <quote> <text>`: an optional kind and `--occurrence N`
+/// (1-based; the first occurrence when absent), in either order.
+fn annotate_options(rest: &[String]) -> Result<(Kind, usize)> {
+    let mut kind = None;
+    let mut occurrence = 1;
+    let mut items = rest.iter().map(String::as_str);
+    while let Some(item) = items.next() {
+        match item {
+            "--occurrence" => {
+                occurrence = items
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| *n >= 1)
+                    .context("--occurrence takes a number from 1")?;
+            }
+            flag if flag.starts_with("--") => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
+            other if kind.is_none() => kind = Some(parse_kind(Some(other))),
+            other => anyhow::bail!("unexpected argument {other:?}\n{USAGE}"),
+        }
+    }
+    Ok((kind.unwrap_or(Kind::Comment), occurrence))
+}
+
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let arg = |i: usize| args.get(i).map(String::as_str);
     let path = |i: usize| arg(i).map(|p| crate::workspace_paths::absolute(Path::new(p))).context(USAGE);
@@ -105,7 +128,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             let mut app = open_app(&path(1)?, 100, false)?;
             let quote = arg(2).context(USAGE)?;
             let body = arg(3).context(USAGE)?.to_owned();
-            app.add_quote_annotation(quote, parse_kind(arg(4)), body)
+            let (kind, occurrence) = annotate_options(args.get(4..).unwrap_or_default())?;
+            app.add_quote_annotation_at(quote, occurrence, kind, body)
         }
         Some("--annotate-block") => {
             let mut app = open_app(&path(1)?, 100, false)?;
