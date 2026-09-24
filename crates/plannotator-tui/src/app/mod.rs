@@ -547,10 +547,23 @@ impl App {
         self.annotate(range, kind, body)
     }
 
-    /// Annotate the first occurrence of `quote` in the source.
-    pub(crate) fn add_quote_annotation(&mut self, quote: &str, kind: Kind, body: String) -> Result<()> {
-        let start =
-            self.open.doc.source.find(quote).ok_or_else(|| anyhow::anyhow!("quote not found: {quote:?}"))?;
+    /// Annotate the `occurrence`-th (1-based) occurrence of `quote` in the source, counting
+    /// non-overlapping matches.
+    pub(crate) fn add_quote_annotation(
+        &mut self,
+        quote: &str,
+        occurrence: usize,
+        kind: Kind,
+        body: String,
+    ) -> Result<()> {
+        let source = &self.open.doc.source;
+        let Some((start, _)) = source.match_indices(quote).nth(occurrence.saturating_sub(1)) else {
+            let found = source.match_indices(quote).count();
+            if found == 0 {
+                anyhow::bail!("quote not found: {quote:?}");
+            }
+            anyhow::bail!("occurrence {occurrence} of {quote:?} not found: it appears {found} time(s)");
+        };
         self.annotate(start..start + quote.len(), kind, body)
     }
 
