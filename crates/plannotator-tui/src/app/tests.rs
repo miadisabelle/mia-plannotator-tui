@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing, reason = "tests assert by panicking")]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use plannotator_tui_schema::{DocumentSource, Kind, Provenance};
 use ratatui::Terminal;
@@ -16,12 +17,70 @@ use super::send::SendState;
 use super::{App, Mode};
 use crate::delivery::{Delivery, Discard, HerdrAgent};
 
+/// A fresh, empty data directory for one test. `App::open` resolves the real one, and a
+/// successful send archives into it, so every app under test is pointed here instead:
+/// nothing a test does may reach the developer's own Plannotator data.
+fn scratch_data_dir() -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plannotator-tui-app-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch data dir");
+    dir
+}
+
 /// A transient source: the app runs exactly as it does on a file, but nothing is written
 /// to the Plannotator data directory.
 fn app(delivery: Box<dyn Delivery>) -> App {
     let source =
         DocumentSource::new("# Plan\n\nfirst thing\n".to_owned(), "plan.md", true, Provenance::Stdin);
-    App::open(source, 60, delivery).expect("app opens")
+    let mut app = App::open(source, 60, delivery).expect("app opens");
+    app.data_dir = scratch_data_dir();
+    app
+}
+
+/// `App::open_message` on `candidates()`, isolated like `app`.
+fn message_app(session_id: Option<&str>, delivery: Box<dyn Delivery>) -> App {
+    opened_message_app(session_id, delivery, false)
+}
+
+/// `message_app`, with `newest` as `plannotator-tui last --newest` passes it.
+fn opened_message_app(session_id: Option<&str>, delivery: Box<dyn Delivery>, newest: bool) -> App {
+    let mut app =
+        App::open_message("claude", "/tmp/transcript.jsonl", session_id, candidates(), 60, delivery, newest)
+            .expect("opens");
+    app.data_dir = scratch_data_dir();
+    app
+}
+
+/// Send the open message review through `Discard` and return the archive's one record.
+fn archived_message_review(app: &mut App) -> serde_json::Value {
+    app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Esc))).expect("esc");
+    app.add_block_annotation(0, Kind::Comment, "x".to_owned()).expect("annotation");
+    app.send_feedback().expect("send");
+    assert_eq!(app.send_state, SendState::Sent);
+    let index = app.data_dir.join("feedback").join(&app.project).join("index.jsonl");
+    let text = std::fs::read_to_string(&index).expect("index written under the test's data dir");
+    serde_json::from_str(text.trim()).expect("one json record")
+}
+
+#[test]
+fn a_message_review_archives_the_session_id_and_the_transcript_path_separately() {
+    let id = "01a04583-a848-7b21-a890-f3ed0c9fef05";
+    let mut app = message_app(Some(id), Box::new(Discard));
+    let record = archived_message_review(&mut app);
+    assert_eq!(record["surface"], "annotate-last");
+    assert_eq!(record["target"]["agent"]["host"], "claude-code");
+    assert_eq!(record["target"]["agent"]["session"], id);
+    assert_eq!(record["target"]["agent"]["transcript"], "/tmp/transcript.jsonl");
+}
+
+#[test]
+fn a_message_review_without_a_session_id_archives_only_the_transcript_path() {
+    let mut app = message_app(None, Box::new(Discard));
+    let record = archived_message_review(&mut app);
+    assert!(record["target"]["agent"].get("session").is_none(), "no id means no session, never the path");
+    assert_eq!(record["target"]["agent"]["transcript"], "/tmp/transcript.jsonl");
 }
 
 fn agent() -> Box<dyn Delivery> {
@@ -73,6 +132,8 @@ fn clicking_the_send_button_sends() {
     });
     app.handle_event(&click).expect("click");
     assert_eq!(app.send_state, SendState::Sent);
+    let index = app.data_dir.join("feedback").join(&app.project).join("index.jsonl");
+    assert!(index.is_file(), "the send was archived under the test's own data dir");
 }
 
 #[test]
@@ -107,8 +168,7 @@ fn candidates() -> Vec<plannotator_tui_hosts::Message> {
 
 #[test]
 fn the_picker_lists_newest_first_and_opens_the_chosen_message() {
-    let mut app = App::open_message("claude", "/tmp/transcript.jsonl", candidates(), 60, Box::new(Discard))
-        .expect("opens");
+    let mut app = message_app(None, Box::new(Discard));
     app.clock_offset = 0;
     assert_eq!(app.mode, Mode::Pick, "more than one candidate asks which");
     let rows = draw(&mut app);
@@ -127,9 +187,42 @@ fn the_picker_lists_newest_first_and_opens_the_chosen_message() {
 }
 
 #[test]
+fn a_status_leads_the_footer_so_a_narrow_pane_cannot_truncate_it_away() {
+    let mut app = message_app(None, Box::new(Discard));
+    app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Esc))).expect("esc");
+    app.set_status("no session id from Herdr, showing the newest transcript for this folder".to_owned());
+    let rows = draw(&mut app);
+    let footer = row(&rows, rows.len() - 1);
+    assert!(footer.trim_start().starts_with("no session id from Herdr"), "footer was {footer:?}");
+    // At 80 columns the whole status is still there: the key help gives up its columns.
+    assert!(
+        footer.contains("no session id from Herdr, showing the newest transcript for this folder"),
+        "footer was {footer:?}"
+    );
+}
+
+#[test]
+fn a_status_leads_the_footer_and_the_name_counters_and_key_help_stay() {
+    let mut app = app(Box::new(Discard));
+    app.add_block_annotation(0, Kind::Comment, "x".to_owned()).expect("annotation");
+    app.set_status("comment saved".to_owned());
+    let rows = draw_sized(&mut app, 140, 20);
+    let footer = row(&rows, 19);
+    assert!(
+        footer.trim_start().starts_with("comment saved · plan.md · 1 annotations · block 1/"),
+        "footer was {footer:?}"
+    );
+    assert!(footer.trim_end().ends_with("· q quit"), "key help is still drawn: {footer:?}");
+    // Once the status is cleared the same line continues with the name.
+    app.status = None;
+    let rows = draw_sized(&mut app, 140, 20);
+    let footer = row(&rows, 19);
+    assert!(footer.trim_start().starts_with("plan.md · 1 annotations · block 1/"), "footer was {footer:?}");
+}
+
+#[test]
 fn escaping_the_picker_keeps_the_newest_message() {
-    let mut app = App::open_message("claude", "/tmp/transcript.jsonl", candidates(), 60, Box::new(Discard))
-        .expect("opens");
+    let mut app = message_app(None, Box::new(Discard));
     app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Esc))).expect("esc");
     assert_eq!(app.mode, Mode::Browse);
     assert_eq!(app.open.doc.source, "# Third\n\nnewest message\n");
@@ -139,9 +232,24 @@ fn escaping_the_picker_keeps_the_newest_message() {
 }
 
 #[test]
+fn newest_opens_the_newest_reply_and_leaves_the_picker_on_p() {
+    let mut app = opened_message_app(None, Box::new(Discard), true);
+    assert_eq!(app.mode, Mode::Browse, "--newest has nothing to ask");
+    assert_eq!(app.open.doc.source, "# Third\n\nnewest message\n");
+    assert_eq!(app.candidates.len(), 3, "the other replies are still there to pick from");
+
+    app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Char('p')))).expect("p");
+    assert_eq!(app.mode, Mode::Pick, "p opens the picker that was never shown");
+    app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Char('j')))).expect("j");
+    assert_eq!(app.open.doc.source, "# Second\n\nmiddle message\n");
+    app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Esc))).expect("esc");
+    assert_eq!(app.mode, Mode::Browse);
+    assert_eq!(app.open.doc.source, "# Third\n\nnewest message\n", "esc returns to what was open");
+}
+
+#[test]
 fn moving_the_picker_cursor_previews_that_message() {
-    let mut app = App::open_message("claude", "/tmp/transcript.jsonl", candidates(), 60, Box::new(Discard))
-        .expect("opens");
+    let mut app = message_app(None, Box::new(Discard));
     assert_eq!(app.open.doc.source, "# Third\n\nnewest message\n", "the newest opens behind the picker");
 
     app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Char('j')))).expect("j");
@@ -152,8 +260,7 @@ fn moving_the_picker_cursor_previews_that_message() {
 
 #[test]
 fn previewing_away_and_back_keeps_annotations() {
-    let mut app = App::open_message("claude", "/tmp/transcript.jsonl", candidates(), 60, Box::new(Discard))
-        .expect("opens");
+    let mut app = message_app(None, Box::new(Discard));
     app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Esc))).expect("esc");
     app.add_block_annotation(0, Kind::Comment, "keep me".to_owned()).expect("annotate");
     assert_eq!(app.open.store.placed().len(), 1);
@@ -203,6 +310,7 @@ fn open_path(app: &App) -> String {
 fn the_tree_scrolls_to_keep_the_cursor_visible_and_hit_tests_through_the_offset() {
     let root = folder(30);
     let mut app = App::open_folder(&root, 100, Box::new(Discard)).expect("folder opens");
+    app.data_dir = scratch_data_dir();
     // 140 columns shows the tree; 20 rows leaves 18 for the body (header + footer).
     draw_sized(&mut app, 140, 20);
     app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Tab))).expect("tab");
@@ -328,4 +436,303 @@ fn pasting_into_the_comment_box_keeps_newlines() {
     app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)).expect("save");
     let placed = app.open.store.placed();
     assert_eq!(placed.last().expect("annotation").annotation.body, "pasted one\npasted two");
+}
+
+#[test]
+fn roaming_moves_by_row_so_a_selection_can_start_mid_block() {
+    // A paragraph with a hard break (two rows), then a list: in block mode `j` from the top lands on "- one",
+    // roaming lands on "second line" of the same block.
+    let source = DocumentSource::new(
+        "first line\\\nsecond line\n\n- one\n- two\n".to_owned(),
+        "doc.md",
+        true,
+        Provenance::Stdin,
+    );
+    let mut app = App::open(source, 60, Box::new(Discard)).expect("app opens");
+    app.data_dir = scratch_data_dir();
+    draw(&mut app);
+    let j = key(KeyCode::Char('j'), KeyModifiers::NONE);
+    app.handle_event(&j).expect("block j");
+    assert_eq!((app.selected, app.cursor.0), (1, 3), "block mode: j skips to the list");
+    app.handle_event(&key(KeyCode::Char('g'), KeyModifiers::NONE)).expect("g");
+
+    app.handle_event(&key(KeyCode::Char('i'), KeyModifiers::NONE)).expect("i");
+    app.handle_event(&j).expect("roam j");
+    assert_eq!((app.selected, app.cursor.0), (0, 1), "roaming: j moves one row, same block");
+    app.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE)).expect("v");
+    app.handle_event(&key(KeyCode::Char('$'), KeyModifiers::NONE)).expect("$");
+    app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)).expect("enter");
+    let pending = app.pending.as_ref().expect("selection finished");
+    assert_eq!(app.open.doc.source.get(pending.range.clone()), Some("second line"));
+
+    // Esc clears the selection, a second Esc leaves roaming, and j jumps blocks again.
+    app.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)).expect("clear");
+    app.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)).expect("leave roam");
+    app.handle_event(&j).expect("block j");
+    assert_eq!(app.selected, 1);
+}
+
+#[test]
+fn a_block_key_ends_roaming() {
+    let mut app = app(Box::new(Discard));
+    draw(&mut app);
+    app.handle_event(&key(KeyCode::Char('i'), KeyModifiers::NONE)).expect("i");
+    assert!(app.roam);
+    app.handle_event(&key(KeyCode::Char('G'), KeyModifiers::NONE)).expect("G");
+    assert!(!app.roam, "jumping to a block puts the cursor back on its first row");
+    assert_eq!(app.cursor, (app.open.layout.blocks[app.selected].first_row, 0));
+}
+
+#[test]
+fn a_column_move_in_block_mode_starts_roaming_so_the_cursor_is_drawn() {
+    // Before roaming existed, h/l moved the cursor in block mode with nothing on screen,
+    // and v then anchored at a column the user never saw.
+    let mut app = app(Box::new(Discard));
+    draw(&mut app);
+    assert!(!app.roam);
+    app.handle_event(&key(KeyCode::Char('l'), KeyModifiers::NONE)).expect("l");
+    assert!(app.roam, "l in block mode enters roaming");
+    assert_eq!(app.cursor, (0, 1), "and moves the cursor by one column");
+    app.handle_event(&key(KeyCode::Right, KeyModifiers::NONE)).expect("right");
+    assert_eq!(app.cursor, (0, 2));
+    app.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE)).expect("v");
+    assert_eq!(app.selection.map(|s| s.anchor()), Some((0, 2)), "v anchors where the cursor is shown");
+}
+
+/// A folder whose only Markdown lives beside a hidden folder and a `.git` full of it.
+fn folder_with_hidden() -> PathBuf {
+    let root = std::env::temp_dir().join(format!("plannotator-tui-hidden-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".agents/drafts")).expect("mkdir");
+    std::fs::create_dir_all(root.join(".git")).expect("mkdir");
+    std::fs::write(root.join("plan.md"), "# Plan\n\nfirst thing\n").expect("write");
+    std::fs::write(root.join(".agents/drafts/draft.md"), "# Draft\n\nnotes\n").expect("write");
+    std::fs::write(root.join(".git/COMMIT_EDITMSG.md"), "# Commit\n").expect("write");
+    root
+}
+
+#[test]
+fn dot_in_the_tree_shows_hidden_folders_but_never_the_skipped_ones() {
+    let root = folder_with_hidden();
+    let mut app = App::open_folder(&root, 100, Box::new(Discard)).expect("folder opens");
+    app.data_dir = scratch_data_dir();
+    draw_sized(&mut app, 140, 20);
+    let names = |app: &App| -> Vec<String> {
+        app.tree.as_ref().expect("tree").rows.iter().map(|r| r.name.clone()).collect()
+    };
+    assert_eq!(names(&app), ["plan.md"], "hidden folders stay out of the default view");
+
+    app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE)).expect("tab");
+    app.handle_event(&key(KeyCode::Char('.'), KeyModifiers::NONE)).expect("dot");
+    assert_eq!(names(&app), ["plan.md", ".agents"], "the toggle lists .agents, never .git");
+    assert_eq!(app.status.as_deref(), Some("hidden entries shown"));
+
+    // The hidden folder opens like any other: expand down to its Markdown and read it.
+    app.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE)).expect("j");
+    app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)).expect("expand .agents");
+    app.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE)).expect("j");
+    app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)).expect("expand drafts");
+    app.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE)).expect("j");
+    app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)).expect("open draft");
+    assert_eq!(open_path(&app), "draft.md");
+
+    // Hiding again leaves the default view, with the document it opened still open.
+    app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE)).expect("tab");
+    app.handle_event(&key(KeyCode::Char('.'), KeyModifiers::NONE)).expect("dot");
+    assert_eq!(names(&app), ["plan.md"]);
+    assert_eq!(app.status.as_deref(), Some("hidden entries hidden"));
+    assert_eq!(open_path(&app), "draft.md", "hiding a folder does not close its open file");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// `app`, on a document of `paragraphs` one-line paragraphs.
+fn paragraphs_app(paragraphs: usize) -> App {
+    let source = DocumentSource::new("paragraph\n\n".repeat(paragraphs), "long.md", true, Provenance::Stdin);
+    let mut app = App::open(source, 60, Box::new(Discard)).expect("app opens");
+    app.data_dir = scratch_data_dir();
+    app
+}
+
+/// The first document row on screen, and the row of the selected block.
+fn view_and_selection(app: &App) -> (usize, usize) {
+    (app.scroll, app.open.layout.blocks[app.selected].first_row)
+}
+
+#[test]
+fn paging_down_takes_the_selection_along_so_the_next_block_key_continues_on_screen() {
+    // ctrl+d once moved only the view: the selection stayed above it, and the next j
+    // scrolled the view back to where paging started.
+    let mut app = paragraphs_app(40);
+    draw(&mut app);
+    app.handle_event(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)).expect("ctrl+d");
+    let (scroll, selected) = view_and_selection(&app);
+    assert!(scroll > 0, "the view pages down");
+    assert!(selected >= scroll, "the selection is on screen, not above it");
+
+    app.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE)).expect("j");
+    assert!(app.scroll >= scroll, "j continues from the paged view instead of jumping back");
+}
+
+#[test]
+fn paging_up_takes_the_selection_along() {
+    let mut app = paragraphs_app(40);
+    draw(&mut app);
+    app.handle_event(&key(KeyCode::Char('G'), KeyModifiers::NONE)).expect("G");
+    app.handle_event(&key(KeyCode::Char('u'), KeyModifiers::CONTROL)).expect("ctrl+u");
+    let height = usize::from(app.geometry.doc.height);
+    let (scroll, selected) = view_and_selection(&app);
+    assert!(selected < scroll + height, "the selection is on screen, not below it");
+}
+
+#[test]
+fn paging_a_document_that_cannot_scroll_selects_the_edge_block() {
+    // Eight paragraphs fit on screen, so the view cannot move and half a page from the
+    // top lands mid-document. Like vim, the page key goes to the end instead.
+    let mut app = paragraphs_app(8);
+    draw(&mut app);
+    app.handle_event(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)).expect("ctrl+d");
+    assert_eq!(app.selected, app.open.doc.blocks.len() - 1, "ctrl+d selects the last block");
+    app.handle_event(&key(KeyCode::Char('u'), KeyModifiers::CONTROL)).expect("ctrl+u");
+    assert_eq!(app.selected, 0, "ctrl+u selects the first block");
+}
+
+#[test]
+fn paging_through_a_block_taller_than_the_screen_selects_that_block() {
+    // A code block taller than the view starts above it after one page; it is still the
+    // block on screen, so paging selects it instead of leaving the selection behind.
+    let code = "line\n".repeat(100);
+    let source = DocumentSource::new(
+        format!("intro\n\n```\n{code}```\n\nafter\n"),
+        "tall.md",
+        true,
+        Provenance::Stdin,
+    );
+    let mut app = App::open(source, 60, Box::new(Discard)).expect("app opens");
+    app.data_dir = scratch_data_dir();
+    draw(&mut app);
+    for _ in 0..6 {
+        app.handle_event(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)).expect("ctrl+d");
+    }
+    assert_eq!(app.selected, 1, "the tall code block is selected");
+    let scroll = app.scroll;
+    app.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE)).expect("j");
+    assert_eq!(app.selected, 2, "j continues to the block after the code");
+    assert!(app.scroll >= scroll, "j moves on from the paged view instead of jumping back");
+}
+
+#[test]
+fn paging_a_one_row_pane_keeps_the_selection() {
+    let mut app = paragraphs_app(40);
+    draw_sized(&mut app, 80, 3);
+    app.handle_event(&key(KeyCode::Char('G'), KeyModifiers::NONE)).expect("G");
+    let selected = app.selected;
+    app.handle_event(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)).expect("ctrl+d");
+    assert_eq!(app.selected, selected, "a page of zero rows does not jump to the top");
+}
+
+/// A reply review over `candidates()` that records what it sends, isolated like `app`.
+fn recorded_message_app() -> (App, super::review_test_support::RecordingDelivery) {
+    let delivery = super::review_test_support::RecordingDelivery::default();
+    let app = message_app(None, Box::new(delivery.clone()));
+    (app, delivery)
+}
+
+fn keys(app: &mut App, codes: &[KeyCode]) {
+    for code in codes {
+        app.handle_event(&Event::Key(KeyEvent::from(*code))).expect("key");
+    }
+}
+
+/// Annotate the newest reply, then open the middle one from the picker.
+fn note_newest_then_open_middle(app: &mut App) {
+    keys(app, &[KeyCode::Esc]);
+    app.add_block_annotation(0, Kind::Comment, "on the newest".to_owned()).expect("annotate");
+    keys(app, &[KeyCode::Char('p'), KeyCode::Char('j'), KeyCode::Enter]);
+    assert_eq!(app.open.doc.source, "# Second\n\nmiddle message\n");
+}
+
+#[test]
+fn notes_on_every_reply_are_sent_together_each_under_its_own_reply() {
+    let (mut app, delivery) = recorded_message_app();
+    note_newest_then_open_middle(&mut app);
+    app.add_block_annotation(1, Kind::Comment, "on the middle".to_owned()).expect("annotate");
+    assert_eq!(app.send_count(), 2, "both replies' notes are waiting");
+
+    keys(&mut app, &[KeyCode::Char('E')]);
+    let calls = delivery.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0],
+        "# Annotations on claude · message 1 of 3 (\"Third\")\n\n\
+         ## Annotation 1 (line 1)\nComment on: \"# Third\"\n> on the newest\n\n\
+         \n# Annotations on claude · message 2 of 3 (\"Second\")\n\n\
+         ## Annotation 1 (line 3)\nComment on: \"middle message\"\n> on the middle\n\n"
+    );
+    assert_eq!(app.send_state, SendState::Sent);
+    assert!(!app.has_unsent(), "every reply's notes were delivered");
+    let status = app.status.clone().expect("status");
+    assert!(status.starts_with("sent 2 annotation(s) across 2 replies"), "{status}");
+
+    let index = app.data_dir.join("feedback").join(&app.project).join("index.jsonl");
+    let text = std::fs::read_to_string(&index).expect("archived");
+    let record: serde_json::Value = serde_json::from_str(text.trim()).expect("one json record");
+    assert_eq!(record["surface"], "annotate-last");
+    assert_eq!(record["feedback"], calls[0].as_str());
+    assert_eq!(record["annotations"].as_array().expect("annotations").len(), 2);
+    drop(calls);
+
+    keys(&mut app, &[KeyCode::Char('p'), KeyCode::Char('k'), KeyCode::Enter]);
+    assert!(app.open.store.all_delivered(), "the newest reply's note was marked sent too");
+    keys(&mut app, &[KeyCode::Char('S')]);
+    assert!(app.quit, "nothing left to send, so S closes");
+    assert_eq!(delivery.calls.borrow().len(), 1, "and does not send again");
+}
+
+#[test]
+fn quitting_with_notes_only_on_a_reply_that_is_not_open_asks_first() {
+    let (mut app, delivery) = recorded_message_app();
+    note_newest_then_open_middle(&mut app);
+    assert!(app.has_unsent(), "the newest reply's note is unsent");
+    keys(&mut app, &[KeyCode::Char('q')]);
+    assert_eq!(app.mode, Mode::ConfirmQuit);
+    assert!(!app.quit);
+    keys(&mut app, &[KeyCode::Char('y')]);
+    assert!(app.quit);
+    let calls = delivery.calls.borrow();
+    assert_eq!(calls.len(), 1, "y sends the note on the reply that is not open");
+    assert!(calls[0].contains("on the newest"), "{}", calls[0]);
+}
+
+/// One reply with notes sends exactly what a review that never used the picker sends,
+/// whichever reply happens to be open.
+#[test]
+fn a_single_annotated_reply_sends_the_same_body_as_before() {
+    let expected = "# Annotations on claude · last message\n\n\
+                    ## Annotation 1 (line 1)\nComment on: \"# Third\"\n> on the newest\n\n";
+    let (mut app, delivery) = recorded_message_app();
+    keys(&mut app, &[KeyCode::Esc]);
+    app.add_block_annotation(0, Kind::Comment, "on the newest".to_owned()).expect("annotate");
+    keys(&mut app, &[KeyCode::Char('E')]);
+    assert_eq!(delivery.calls.borrow().as_slice(), [expected]);
+
+    let (mut app, delivery) = recorded_message_app();
+    note_newest_then_open_middle(&mut app);
+    keys(&mut app, &[KeyCode::Char('E')]);
+    assert_eq!(delivery.calls.borrow().as_slice(), [expected]);
+    assert_eq!(app.status.as_deref(), Some("sent 1 annotation(s) → test agent"));
+}
+
+#[test]
+fn a_reply_already_sent_is_not_sent_again_from_another_reply() {
+    let (mut app, delivery) = recorded_message_app();
+    keys(&mut app, &[KeyCode::Esc]);
+    app.add_block_annotation(0, Kind::Comment, "on the newest".to_owned()).expect("annotate");
+    keys(&mut app, &[KeyCode::Char('E')]);
+    keys(&mut app, &[KeyCode::Char('p'), KeyCode::Char('j'), KeyCode::Enter]);
+    app.add_block_annotation(1, Kind::Comment, "on the middle".to_owned()).expect("annotate");
+    keys(&mut app, &[KeyCode::Char('E')]);
+    let calls = delivery.calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].contains("on the middle"), "{}", calls[1]);
+    assert!(!calls[1].contains("on the newest"), "the newest reply was sent already: {}", calls[1]);
 }

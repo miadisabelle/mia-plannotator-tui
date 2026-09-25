@@ -30,14 +30,15 @@ const USAGE: &str = "usage:
   plannotator-tui --blocks <file.md>
   plannotator-tui --annotate <file.md> <quote> <text> [comment|looks_good|delete] [--occurrence N]
   plannotator-tui --annotate-block <file.md> <block> <text>
-  plannotator-tui --snapshot <file.md> [cols rows scroll] [select-quote]
+  plannotator-tui --snapshot <file.md> [cols rows scroll] [select-quote] [menu]
   plannotator-tui config
   plannotator-tui --version
   plannotator-tui herdr open [file.md | folder] [--placement overlay|split|popup] [--deliver-to <pane>]
-  plannotator-tui herdr last [--placement P] [--deliver-to <pane>]
+  plannotator-tui herdr last [--placement P] [--deliver-to <pane>] [--newest]
+  plannotator-tui herdr terminal [--lines N] [--placement P] [--deliver-to <pane>] [--print]
   plannotator-tui herdr pane
   plannotator-tui last [--host claude|codex|pi|omp|copilot|droid|hermes|opencode] [--pid N] [--session <transcript>]
-                       [--session-id <id>] [--stdin] [--print] [--pick N]";
+                       [--session-id <id>] [--stdin] [--print] [--pick N] [--newest]";
 
 /// Width the document gets when nothing else is known: gutter + rail + gap subtracted.
 fn doc_width(cols: u16) -> usize {
@@ -129,7 +130,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             let quote = arg(2).context(USAGE)?;
             let body = arg(3).context(USAGE)?.to_owned();
             let (kind, occurrence) = annotate_options(args.get(4..).unwrap_or_default())?;
-            app.add_quote_annotation(quote, occurrence, kind, body)
+            app.add_quote_annotation_at(quote, occurrence, kind, body)
         }
         Some("--annotate-block") => {
             let mut app = open_app(&path(1)?, 100, false)?;
@@ -141,7 +142,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             let cols: u16 = arg(2).and_then(|s| s.parse().ok()).unwrap_or(140);
             let rows: u16 = arg(3).and_then(|s| s.parse().ok()).unwrap_or(40);
             let scroll: i64 = arg(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-            snapshot(&path(1)?, cols, rows, scroll, arg(5))
+            // A trailing `menu` opens the Review menu; a quote may come before it.
+            let menu = args.get(5..).is_some_and(|rest| rest.last().is_some_and(|last| last == "menu"));
+            let select = arg(5).filter(|quote| *quote != "menu");
+            snapshot(&path(1)?, cols, rows, scroll, select, menu)
         }
         Some("--version" | "-V") => {
             println!("plannotator-tui {}", env!("CARGO_PKG_VERSION"));
@@ -160,19 +164,25 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 fn show_config() -> Result<()> {
     let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let path = crate::config::config_path(|k| std::env::var(k).ok(), &home);
-    let config = Config::load_from(&path)?;
+    let mut config = Config::load_from(&path)?;
+    // `PLANNOTATOR_TUI_THEME` overrides the file, so the file's value is not the effective one.
+    config.ui.theme = crate::theme::effective_setting(|key| std::env::var(key).ok(), config.ui.theme)?;
     let state = if path.is_file() { "" } else { " (not present; defaults)" };
     println!("# {}{state}", path.display());
     print!("{}", config.to_toml()?);
     Ok(())
 }
 
-/// `plannotator-tui herdr open [PATH] [--placement P] [--deliver-to PANE]`.
+/// `plannotator-tui herdr open [PATH] [--placement P] [--deliver-to PANE]`;
+/// `herdr last` takes `--newest` on top, which `open` has nothing to skip.
 fn herdr_command(args: &[String]) -> Result<()> {
     use crate::herdr::launch::{OpenArgs, agent_get, agent_identity, plan, plan_last, process_info, run};
     let sub = args.first().map(String::as_str);
     if sub == Some("pane") {
         return herdr_pane();
+    }
+    if sub == Some("terminal") {
+        return herdr_terminal(args.get(1..).unwrap_or_default());
     }
     if !matches!(sub, Some("open" | "last")) {
         anyhow::bail!(USAGE);
@@ -187,6 +197,10 @@ fn herdr_command(args: &[String]) -> Result<()> {
             }
             "--deliver-to" => {
                 open.deliver_to = Some(rest.next().context("--deliver-to needs a value")?.clone());
+            }
+            "--newest" if sub == Some("last") => open.newest = true,
+            "--newest" => {
+                anyhow::bail!("--newest is only for `herdr last`; `herdr open` has no picker to skip")
             }
             flag if flag.starts_with("--") => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
             path if open.path.is_none() => open.path = Some(PathBuf::from(path)),
@@ -212,16 +226,62 @@ fn herdr_command(args: &[String]) -> Result<()> {
     run(&env, &launch)
 }
 
+/// `plannotator-tui herdr terminal [--lines N] [--placement P] [--deliver-to PANE] [--print]`:
+/// review the focused pane's recent output. The read happens here first so a pane with
+/// nothing to show fails before a review pane opens; `--print` stops after it.
+fn herdr_terminal(args: &[String]) -> Result<()> {
+    use crate::herdr::launch::{OpenArgs, TerminalRead, plan_terminal, run};
+    use crate::herdr::terminal;
+    let mut open = OpenArgs::default();
+    let mut lines = terminal::DEFAULT_LINES;
+    let mut print = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--lines" => {
+                lines = rest
+                    .next()
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .filter(|n| *n >= 1)
+                    .context("--lines takes a number from 1")?;
+            }
+            "--placement" => {
+                let value = rest.next().context("--placement needs a value")?;
+                open.placement = Some(value.parse()?);
+            }
+            "--deliver-to" => {
+                open.deliver_to = Some(rest.next().context("--deliver-to needs a value")?.clone());
+            }
+            "--print" => print = true,
+            other => anyhow::bail!("unexpected argument {other:?}\n{USAGE}"),
+        }
+    }
+    let env = HerdrEnv::from_env();
+    let pane = env.reviewed_pane().context("no focused pane to read")?;
+    let text = terminal::read(&env, &pane, lines)?;
+    if print {
+        print!("{}", terminal::document(&text));
+        return Ok(());
+    }
+    let config = Config::load()?;
+    let cwd = std::env::current_dir().context("current directory")?;
+    let launch = plan_terminal(&env, &config, open, &cwd, TerminalRead { pane, lines })?;
+    run(&env, &launch)
+}
+
 /// The pane entrypoint: Herdr runs this in the opened pane; the environment says what to show.
 fn herdr_pane() -> Result<()> {
     let env = HerdrEnv::from_env();
-    let result = if env.has_message_source() {
+    let result = if let Some(pane) = env.terminal_pane.clone() {
+        crate::herdr::terminal::run(&env, &pane)
+    } else if env.has_message_source() {
         crate::last::run(&crate::last::LastOptions {
             host: env.host.clone(),
             pid: env.message_pid,
             session: env.session.clone(),
             session_id: env.session_id.clone(),
             pick: 25,
+            newest: env.newest,
             ..crate::last::LastOptions::default()
         })
     } else {
@@ -240,7 +300,8 @@ fn herdr_pane() -> Result<()> {
     result
 }
 
-/// `plannotator-tui last [--host H] [--pid N] [--session PATH] [--stdin] [--print] [--pick N]`.
+/// `plannotator-tui last [--host H] [--pid N] [--session PATH] [--stdin] [--print] [--pick N]
+/// [--newest]`.
 fn last_command(args: &[String]) -> Result<()> {
     use crate::last::LastOptions;
     let mut options = LastOptions { pick: 25, ..LastOptions::default() };
@@ -258,6 +319,7 @@ fn last_command(args: &[String]) -> Result<()> {
             "--stdin" => options.stdin = true,
             "--print" => options.print = true,
             "--pick" => options.pick = rest.next().context("--pick needs a value")?.parse()?,
+            "--newest" => options.newest = true,
             other => anyhow::bail!("unknown argument {other}\n{USAGE}"),
         }
     }
@@ -270,6 +332,15 @@ fn interactive(path: &PathBuf) -> Result<()> {
 
 /// Own the terminal for one app: `build` gets the document width the screen allows.
 pub(crate) fn run_ui(build: impl FnOnce(usize) -> Result<App>) -> Result<()> {
+    // Settle the palette before the screen is ours: the background-colour query talks to
+    // the terminal directly, and it must not race the alternate screen or the event loop.
+    crate::theme::install(crate::theme::resolve(
+        |key| std::env::var(key).ok(),
+        // A config that fails to parse never kept the plain TUI from starting; it still does
+        // not. `plannotator-tui config` is where the error is reported.
+        Config::load().map(|config| config.ui.theme).unwrap_or_default(),
+        crate::theme::detect,
+    )?);
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
     let _ = execute!(stdout(), EnableBracketedPaste);
@@ -358,16 +429,26 @@ fn bench(path: &PathBuf) -> Result<()> {
 }
 
 /// Draw one frame into an in-memory backend and print it as text, followed by a mark map:
-/// `#` comment, `+` looks good, `-` delete, `%` selected.
-fn snapshot(path: &PathBuf, cols: u16, rows: u16, scroll: i64, select: Option<&str>) -> Result<()> {
+/// `#` comment, `+` looks good, `-` delete, `%` selected or highlighted.
+fn snapshot(
+    path: &PathBuf,
+    cols: u16,
+    rows: u16,
+    scroll: i64,
+    select: Option<&str>,
+    menu: bool,
+) -> Result<()> {
     use ratatui::backend::TestBackend;
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Modifier;
     let mut terminal = ratatui::Terminal::new(TestBackend::new(cols, rows))?;
     let mut app = open_app(path, doc_width(cols), false)?;
     terminal.draw(|frame| app.draw(frame))?;
     app.scroll_for_snapshot(scroll);
     if let Some(quote) = select {
         app.select_quote_for_snapshot(quote)?;
+    }
+    if menu {
+        app.open_review_menu();
     }
     terminal.draw(|frame| app.draw(frame))?;
     let buffer = terminal.backend().buffer();
@@ -383,9 +464,9 @@ fn snapshot(path: &PathBuf, cols: u16, rows: u16, scroll: i64, select: Option<&s
                 '%'
             } else if style.add_modifier.contains(Modifier::CROSSED_OUT) {
                 '-'
-            } else if style.bg == Some(Color::Indexed(22)) {
+            } else if style.bg == Some(crate::theme::palette().approve_bg) {
                 '+'
-            } else if style.bg == Some(Color::Indexed(58)) {
+            } else if style.bg == Some(crate::theme::palette().comment_bg) {
                 '#'
             } else {
                 ' '

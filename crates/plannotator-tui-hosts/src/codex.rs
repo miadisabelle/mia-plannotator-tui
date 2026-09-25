@@ -45,14 +45,16 @@ fn all_rollouts(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The thread id is the trailing uuid of `rollout-<timestamp>-<uuid>.jsonl`.
-fn thread_of(path: &Path) -> Option<String> {
+pub(crate) fn thread_of(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let parts: Vec<&str> = stem.rsplitn(6, '-').collect();
     (parts.len() == 6).then(|| parts.iter().take(5).rev().copied().collect::<Vec<_>>().join("-"))
 }
 
-/// Subagent rollouts (reviews, guardians) record `source.subagent` in their session meta.
-fn is_subagent(path: &Path) -> bool {
+/// Does `path` hold a subagent rollout? Subagent rollouts (reviews, guardians) record
+/// `source.subagent` in the session meta on their first line. Unreadable or malformed
+/// files are not subagents.
+pub fn is_subagent(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else { return false };
     text.lines()
         .next()

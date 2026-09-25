@@ -13,12 +13,23 @@ cargo build --release
 | Where | Keys |
 |---|---|
 | anywhere | `Tab` cycle focus (tree · document · rail) · `E` send feedback (clipboard) · `t` show/hide tree · `r` reload · `q` quit |
-| document | drag with the mouse, or `v` then `hjkl` / `w` `b` / `0` `$` to select; `Enter` confirms · `j`/`k` or click selects a block · `c` comments on the block · `x` clears the block's annotations |
+| document | drag with the mouse, or `v` then `hjkl` / `w` `b` / `0` `$` to select; `Enter` confirms · `i` moves the cursor with those keys first, so `v` can start mid-block · `j`/`k` or click selects a block · `c` comments on the block · `x` clears the block's annotations · wide Markdown tables wrap by cell |
 | selection toolbar | `a` 👍 looks good · `c` 💬 comment (opens a box at the selection) · `d` ✗ delete · `Esc` clears |
 | rail | `j`/`k` move · `e` / `Enter` edit body · `x` remove · click a bubble to focus it |
-| tree | `j`/`k` move · `Enter` open · `E` send feedback for every annotated file · counts show per file |
+| reply review | `S` send feedback and quit; stays open if the agent is at a dialog |
+| file/folder review | `E` send new · `m` review menu (`R` resend all · `F` finish review · `U` undo · `H` archive) |
+| tree | `j`/`k` move · `Enter` open · `.` show/hide hidden (dot-prefixed) entries · `E` send new feedback across files, including collapsed folders · counts show active notes per file |
+| archive | `j`/`k` or ↑/↓ select · `Enter` or click restore · `Esc` close |
 
 Selections and exports are copied to the terminal clipboard (OSC 52).
+
+Sent notes remain visible. File reviews send only new or edited notes by default;
+`R` explicitly includes the sent ones too. `F` archives only sent notes that have not
+changed since delivery. Archived notes survive restarts, and restoring them keeps their
+ids and delivery history. Failed sends keep the feedback pending. The header shows the
+send button and a `Review ▾ (m)` button; its menu lists the four actions with live counts,
+dims the ones with nothing to act on, and runs a row on `Enter`, a click, or the row's own
+key. The keys also work directly, without the menu.
 
 ## Where things live
 
@@ -32,17 +43,18 @@ Every annotation is saved the moment it is made, as JSON, in the Plannotator dat
 sha256 of the path), so one file maps to one directory in both tools. The records are in the
 Plannotator Workspaces wire shape (`plannotator-tui-schema`); any agent can read them. Nothing is
 written next to your files. `PLANNOTATOR_DATA_DIR` relocates the directory. Transient
-documents (an agent's last message, stdin) are never persisted.
+documents (an agent's last message, a pane's terminal output, stdin) are never persisted.
 
 ## Headless tools
 
 ```bash
-plannotator-tui --export <file.md>                     # feedback markdown to stdout
+plannotator-tui --export <file.md>                     # all active feedback to stdout; does not mark it sent
 plannotator-tui --bench <file.md>                      # parse / render / reflow timings
 plannotator-tui --blocks <file.md>                     # block index, kind, first row
 plannotator-tui --annotate <file.md> <quote> <text> [comment|looks_good|delete] [--occurrence N]
 plannotator-tui --annotate-block <file.md> <block> <text>
 plannotator-tui --snapshot <file|folder> [cols rows scroll] [select-quote]   # one frame as text + mark map
+plannotator-tui herdr terminal [--lines N] --print     # the focused Herdr pane's recent output, as the review document
 ```
 
 ## Measured (Apple Silicon, release build)

@@ -1,6 +1,7 @@
 //! The message picker: which of the agent's recent messages to review. Newest first, the
 //! newest already open behind it.
 
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -16,25 +17,33 @@ use unicode_width::UnicodeWidthStr as _;
 
 use super::{App, Mode, Open};
 use crate::last::message_source;
+use crate::theme::palette;
 
 const PICK_MAX_WIDTH: u16 = 90;
 
 impl App {
     /// Open with `messages` (newest first) as candidates; the picker shows when there is a
-    /// choice to make.
+    /// choice to make. `transcript` is the path shown and archived; `session_id` is the
+    /// host's own id for the session, when known.
+    ///
+    /// `newest` asks for the newest message and nothing in the way: the candidates are
+    /// still kept, so `p` opens the picker on them exactly as escaping it would have.
     pub(crate) fn open_message(
         host: &str,
         transcript: &str,
+        session_id: Option<&str>,
         messages: Vec<Message>,
         width: usize,
         delivery: Box<dyn crate::delivery::Delivery>,
+        newest: bool,
     ) -> Result<Self> {
-        let Some(newest) = messages.first() else { anyhow::bail!("no message to open") };
-        let mut app = Self::open(message_source(host, transcript, newest), width, delivery)?;
+        let Some(first) = messages.first() else { anyhow::bail!("no message to open") };
+        let mut app = Self::open(message_source(host, session_id, first), width, delivery)?;
         host.clone_into(&mut app.message_host);
         transcript.clone_into(&mut app.message_transcript);
+        app.message_session = session_id.map(str::to_owned);
         app.candidates = messages;
-        if app.candidates.len() > 1 {
+        if app.candidates.len() > 1 && !newest {
             app.mode = Mode::Pick;
         }
         Ok(app)
@@ -53,7 +62,7 @@ impl App {
             open
         } else {
             let Some(message) = self.candidates.get(index) else { return Ok(()) };
-            let source = message_source(&self.message_host, &self.message_transcript, message);
+            let source = message_source(&self.message_host, self.message_session.as_deref(), message);
             Open::new(source, self.open.layout.width, &self.data_dir, &self.project)?
         };
         let leaving = std::mem::replace(&mut self.open, next);
@@ -153,7 +162,7 @@ impl App {
                 pick_rows.push((row, index));
                 let text =
                     fit(&pick_label(message, self.clock_offset), usize::from(inner.width).saturating_sub(1));
-                let style = if index == self.pick_cursor { Style::new().reversed() } else { Style::new() };
+                let style = if index == self.pick_cursor { palette().selection } else { Style::new() };
                 Line::from(Span::styled(format!(" {text}"), style))
             })
             .collect();
@@ -189,22 +198,32 @@ fn clock(at: &str, offset_minutes: i32) -> Option<String> {
 
 /// Minutes east of UTC for this machine, resolved once.
 ///
-/// `std` has no local-time API and this crate carries no date dependency, so the offset
-/// comes from `date +%z` - the same shell-out `last::locate` already uses. Anything
-/// unexpected leaves the clock in UTC, which is what it showed before.
+/// `std` has no local-time API. On Unix the offset comes from `date +%z`, the same
+/// shell-out `last::locate` already uses; on Windows, from the time zone the OS reports,
+/// which `time` reads without touching the environment. Anything unexpected leaves the
+/// clock in UTC, which is what it showed before.
 pub(super) fn local_offset_minutes() -> i32 {
     static OFFSET: OnceLock<i32> = OnceLock::new();
     *OFFSET.get_or_init(|| {
-        if !cfg!(unix) {
-            return 0;
+        #[cfg(unix)]
+        {
+            let Ok(output) = Command::new("date").arg("+%z").output() else { return 0 };
+            let Ok(text) = String::from_utf8(output.stdout) else { return 0 };
+            parse_utc_offset(text.trim()).unwrap_or(0)
         }
-        let Ok(output) = Command::new("date").arg("+%z").output() else { return 0 };
-        let Ok(text) = String::from_utf8(output.stdout) else { return 0 };
-        parse_utc_offset(text.trim()).unwrap_or(0)
+        #[cfg(windows)]
+        {
+            time::UtcOffset::current_local_offset().map_or(0, |offset| i32::from(offset.whole_minutes()))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            0
+        }
     })
 }
 
 /// `+0530` or `-0800` as minutes east of UTC.
+#[cfg(unix)]
 fn parse_utc_offset(zone: &str) -> Option<i32> {
     let sign = match zone.as_bytes().first()? {
         b'+' => 1,
@@ -233,7 +252,9 @@ fn fit(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clock, parse_utc_offset};
+    #[cfg(unix)]
+    use super::parse_utc_offset;
+    use super::{clock, local_offset_minutes};
 
     #[test]
     fn a_utc_stamp_is_shown_on_the_local_clock() {
@@ -247,6 +268,13 @@ mod tests {
         assert_eq!(clock("2026-08-31T19:53:52+05:30", 330).as_deref(), Some("19:53"));
     }
 
+    #[test]
+    fn the_local_offset_is_a_real_time_zone_on_every_platform() {
+        let minutes = local_offset_minutes();
+        assert!((-14 * 60..=14 * 60).contains(&minutes), "{minutes}");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_zone_string_reads_as_minutes_east_of_utc() {
         assert_eq!(parse_utc_offset("+0530"), Some(330));

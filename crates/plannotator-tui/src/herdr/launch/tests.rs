@@ -40,7 +40,7 @@ fn human_keybind_opens_the_focused_folder_and_delivers_to_its_agent() {
             "pane",
             "open",
             "--plugin",
-            "plannotator-tui",
+            "annotate",
             "--entrypoint",
             "doc",
             "--placement",
@@ -78,6 +78,40 @@ fn agent_skill_delivers_to_and_splits_beside_the_calling_pane() {
 }
 
 #[test]
+fn mirror_defaults_to_a_split_next_to_the_remote_invoking_pane() {
+    let context = HerdrContext {
+        focused_pane_id: Some("w2:p4".into()),
+        focused_pane_agent: Some("codex".into()),
+        invocation_source: Some("mirror".into()),
+        ..HerdrContext::default()
+    };
+    let env = env(None, Some(context));
+    let launch = plan(&env, &Config::default(), OpenArgs::default(), Path::new("/"))
+        .expect("plans a mirrored document");
+    assert_eq!(launch.placement, Placement::Split);
+    assert!(argv(&launch).windows(2).any(|pair| pair == ["--target-pane", "w2:p4"]));
+    let agent = r#"{"result":{"agent":{"agent":"codex","agent_session":{"kind":"path","value":"/sessions/exact.jsonl"}}}}"#;
+    let last = plan_last(&env, &Config::default(), OpenArgs::default(), Path::new("/"), None, Some(agent))
+        .expect("plans the same pane's reply");
+    assert_eq!(last.placement, Placement::Split);
+    assert_eq!(last.target_pane.as_deref(), Some("w2:p4"));
+    assert_eq!(last.session, Some(AgentSession::Path("/sessions/exact.jsonl".into())));
+}
+
+#[test]
+fn explicit_placement_still_wins_over_the_mirror_default() {
+    let mut env =
+        env(None, Some(HerdrContext { invocation_source: Some("mirror".into()), ..HerdrContext::default() }));
+    env.placement = Some("popup".into());
+    let launch =
+        plan(&env, &Config::default(), OpenArgs::default(), Path::new("/")).expect("environment placement");
+    assert_eq!(launch.placement, Placement::Popup);
+    let args = OpenArgs { placement: Some(Placement::Overlay), ..OpenArgs::default() };
+    let launch = plan(&env, &Config::default(), args, Path::new("/")).expect("explicit argument placement");
+    assert_eq!(launch.placement, Placement::Overlay);
+}
+
+#[test]
 fn ctrl_click_opens_the_linked_file() {
     let root = temp_folder("click");
     // `file:///abs/path` on Unix; `file:///C:/abs/path` on Windows.
@@ -111,7 +145,11 @@ fn only_file_urls_are_opened() {
 #[test]
 fn popup_placement_emits_size_and_no_target_pane() {
     let config = Config::parse("[herdr]\npopup_width = \"100%\"\npopup_height = \"100%\"\n").expect("config");
-    let args = OpenArgs { placement: Some(Placement::Popup), deliver_to: Some("w1:p1".into()), path: None };
+    let args = OpenArgs {
+        placement: Some(Placement::Popup),
+        deliver_to: Some("w1:p1".into()),
+        ..OpenArgs::default()
+    };
     let launch = plan(&env(Some("w1:p9"), None), &config, args, Path::new("/tmp")).expect("plans");
     assert_eq!(launch.deliver, Some(Target { pane: "w1:p1".into(), agent: None }), "--deliver-to wins");
     let args = argv(&launch);
@@ -264,4 +302,78 @@ fn herdrs_agent_session_is_passed_to_the_pane_as_a_path_or_an_id() {
     .expect("plans");
     let args = argv(&launch);
     assert!(args.contains(&"PLANNOTATOR_TUI_SESSION_ID=sess_abc123".to_owned()), "{args:?}");
+}
+
+#[test]
+fn newest_reaches_the_pane_only_when_last_was_asked_for_it() {
+    let context = HerdrContext {
+        focused_pane_id: Some("w1:p1".into()),
+        focused_pane_agent: Some("claude".into()),
+        focused_pane_cwd: Some("/w".into()),
+        ..HerdrContext::default()
+    };
+    let last = |args| {
+        plan_last(
+            &env(None, Some(context.clone())),
+            &Config::default(),
+            args,
+            Path::new("/"),
+            None,
+            Some(AGENT_GET_PI),
+        )
+        .expect("plans")
+    };
+    let asked = OpenArgs { newest: true, ..OpenArgs::default() };
+    assert!(argv(&last(asked)).contains(&"PLANNOTATOR_TUI_NEWEST=1".to_owned()));
+    assert!(!argv(&last(OpenArgs::default())).iter().any(|a| a.starts_with("PLANNOTATOR_TUI_NEWEST")));
+
+    // `herdr open` has no picker to skip, so a document launch never carries the flag.
+    let open = plan(&env(None, Some(context)), &Config::default(), OpenArgs::default(), Path::new("/"))
+        .expect("plans");
+    assert!(!argv(&open).iter().any(|a| a.starts_with("PLANNOTATOR_TUI_NEWEST")));
+}
+
+#[test]
+fn terminal_review_reads_the_focused_pane_and_delivers_to_its_agent() {
+    let context = HerdrContext {
+        focused_pane_id: Some("w1:p1".into()),
+        focused_pane_agent: Some("claude".into()),
+        focused_pane_cwd: Some("/w".into()),
+        ..HerdrContext::default()
+    };
+    let read = TerminalRead { pane: "w1:p1".into(), lines: 200 };
+    let launch = plan_terminal(
+        &env(None, Some(context)),
+        &Config::default(),
+        OpenArgs::default(),
+        Path::new("/"),
+        read,
+    )
+    .expect("plans");
+    let args = argv(&launch);
+    assert!(args.contains(&"PLANNOTATOR_TUI_TERMINAL_PANE=w1:p1".to_owned()), "{args:?}");
+    assert!(args.contains(&"PLANNOTATOR_TUI_TERMINAL_LINES=200".to_owned()), "{args:?}");
+    assert!(args.contains(&"PLANNOTATOR_TUI_DELIVER_TO=w1:p1".to_owned()), "{args:?}");
+    assert!(args.contains(&"PLANNOTATOR_TUI_DELIVER_AGENT=claude".to_owned()), "{args:?}");
+    assert!(!args.iter().any(|a| a.starts_with("PLANNOTATOR_TUI_FILE=")), "a terminal review opens no file");
+    assert!(!args.iter().any(|a| a.starts_with("PLANNOTATOR_TUI_HOST=")), "nor an agent message");
+}
+
+#[test]
+fn terminal_review_of_a_shell_splits_beside_it_and_delivers_nowhere() {
+    let context = HerdrContext {
+        focused_pane_id: Some("w1:p4".into()),
+        focused_pane_cwd: Some("/w".into()),
+        ..HerdrContext::default()
+    };
+    let read = TerminalRead { pane: "w1:p4".into(), lines: 50 };
+    let args = OpenArgs { placement: Some(Placement::Split), ..OpenArgs::default() };
+    let launch =
+        plan_terminal(&env(Some("w9:p9"), Some(context)), &Config::default(), args, Path::new("/"), read)
+            .expect("plans");
+    assert_eq!(launch.deliver, None, "no agent in the pane: the review falls back to the clipboard");
+    let args = argv(&launch);
+    let target = args.iter().position(|a| a == "--target-pane").and_then(|i| args.get(i + 1));
+    assert_eq!(target.map(String::as_str), Some("w1:p4"));
+    assert!(args.contains(&"PLANNOTATOR_TUI_TERMINAL_PANE=w1:p4".to_owned()), "{args:?}");
 }

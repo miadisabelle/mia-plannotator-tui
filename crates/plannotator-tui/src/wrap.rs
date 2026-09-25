@@ -3,10 +3,15 @@
 //! `tui-markdown` emits one `Line` per logical line and never wraps; the layout needs
 //! exact row counts and the selection needs to know which source byte sits under each
 //! screen column, so both live here. Generic text wrapping — no markdown knowledge.
+//! Reflowing a rendered table is the one shape-aware job, and it lives in `wrap::table`.
+
+mod table;
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
+
+pub(crate) use table::wrap_table;
 
 /// One screen row: styled text plus, per column, the source byte it came from.
 #[derive(Debug)]
@@ -39,11 +44,37 @@ fn cells_of(line: &Line<'_>, offsets: &[Option<usize>]) -> Vec<Cell> {
         .collect()
 }
 
-/// Turn accumulated cells into a row, merging same-style runs into spans.
-fn finish_row(mut cells: Vec<Cell>, line_style: Style) -> Row {
+/// Drop trailing whitespace: a wrapped piece can end on the space it broke at.
+fn trim_trailing_space(mut cells: Vec<Cell>) -> Vec<Cell> {
     while cells.last().is_some_and(|c| c.ch.is_whitespace()) {
         cells.pop();
     }
+    cells
+}
+
+/// Keep the leading cells that fit `width` columns, dropping the rest.
+fn clip_cells(cells: Vec<Cell>, width: usize) -> Vec<Cell> {
+    let mut used = 0usize;
+    cells
+        .into_iter()
+        .take_while(|cell| {
+            let fits = used + cell.width <= width;
+            if fits {
+                used += cell.width;
+            }
+            fits
+        })
+        .collect()
+}
+
+/// Columns a run of cells occupies on screen.
+fn cells_width(cells: &[Cell]) -> usize {
+    cells.iter().map(|cell| cell.width).sum()
+}
+
+/// Turn accumulated cells into a row, merging same-style runs into spans.
+fn finish_row(cells: Vec<Cell>, line_style: Style) -> Row {
+    let cells = trim_trailing_space(cells);
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut columns: Vec<Option<usize>> = Vec::new();
     for cell in &cells {
@@ -56,26 +87,27 @@ fn finish_row(mut cells: Vec<Cell>, line_style: Style) -> Row {
     Row { line: Line::from(spans).style(line_style), cells: columns }
 }
 
-/// Wrap one logical line into as many rows as needed for `width` columns.
-/// `offsets` has one entry per char of the line. An empty line yields one empty row.
-pub(crate) fn wrap_line(line: &Line<'_>, offsets: &[Option<usize>], width: usize) -> Vec<Row> {
+/// Split cells into the runs that fit `width` columns each. One empty piece for no cells.
+///
+/// Cells, not `Row`s: a `Row` records one offset per *column*, so reading offsets back out
+/// of one would mis-pair them after any wide or zero-width char.
+fn wrap_cells(cells: &[Cell], width: usize) -> Vec<Vec<Cell>> {
     let width = width.max(1);
-    let cells = cells_of(line, offsets);
-    let mut rows: Vec<Row> = Vec::new();
+    let mut pieces: Vec<Vec<Cell>> = Vec::new();
     let mut current: Vec<Cell> = Vec::new();
     let mut current_width = 0usize;
 
     // Tokens are unbreakable runs: a word, or a run of whitespace.
-    let mut rest = cells.as_slice();
+    let mut rest = cells;
     while let Some(first) = rest.first() {
         let is_space = first.ch.is_whitespace();
         let len = rest.iter().take_while(|c| c.ch.is_whitespace() == is_space).count();
         let (token, tail) = rest.split_at(len);
         rest = tail;
-        let token_width: usize = token.iter().map(|c| c.width).sum();
+        let token_width = cells_width(token);
 
         // Whitespace at a row start is dropped, except leading indentation on the first row.
-        if is_space && current.is_empty() && !rows.is_empty() {
+        if is_space && current.is_empty() && !pieces.is_empty() {
             continue;
         }
         if current_width + token_width <= width {
@@ -84,7 +116,7 @@ pub(crate) fn wrap_line(line: &Line<'_>, offsets: &[Option<usize>], width: usize
             continue;
         }
         if !current.is_empty() {
-            rows.push(finish_row(std::mem::take(&mut current), line.style));
+            pieces.push(std::mem::take(&mut current));
             current_width = 0;
             if is_space {
                 continue;
@@ -97,7 +129,7 @@ pub(crate) fn wrap_line(line: &Line<'_>, offsets: &[Option<usize>], width: usize
             // Token wider than a row: hard-split by cells.
             for cell in token {
                 if current_width + cell.width > width && !current.is_empty() {
-                    rows.push(finish_row(std::mem::take(&mut current), line.style));
+                    pieces.push(std::mem::take(&mut current));
                     current_width = 0;
                 }
                 current.push(*cell);
@@ -105,26 +137,24 @@ pub(crate) fn wrap_line(line: &Line<'_>, offsets: &[Option<usize>], width: usize
             }
         }
     }
-    if !current.is_empty() || rows.is_empty() {
-        rows.push(finish_row(current, line.style));
+    if !current.is_empty() || pieces.is_empty() {
+        pieces.push(current);
     }
-    rows
+    pieces
+}
+
+/// Wrap one logical line into as many rows as needed for `width` columns.
+/// `offsets` has one entry per char of the line. An empty line yields one empty row.
+pub(crate) fn wrap_line(line: &Line<'_>, offsets: &[Option<usize>], width: usize) -> Vec<Row> {
+    wrap_cells(&cells_of(line, offsets), width)
+        .into_iter()
+        .map(|piece| finish_row(piece, line.style))
+        .collect()
 }
 
 /// Keep one row; clip anything past `width` (code and tables keep their columns).
 pub(crate) fn clip_line(line: &Line<'_>, offsets: &[Option<usize>], width: usize) -> Row {
-    let mut used = 0usize;
-    let kept = cells_of(line, offsets)
-        .into_iter()
-        .take_while(|cell| {
-            let fits = used + cell.width <= width;
-            if fits {
-                used += cell.width;
-            }
-            fits
-        })
-        .collect();
-    finish_row(kept, line.style)
+    finish_row(clip_cells(cells_of(line, offsets), width), line.style)
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use plannotator_tui_hosts::{Host, HostError, Message, Role, detect_host, sniff};
 use plannotator_tui_schema::{DocumentSource, Provenance};
 
+use super::fallback::Discovery;
 use super::roots::Roots;
 use super::{LastOptions, exact, fallback, readers};
 
@@ -14,8 +15,13 @@ pub(crate) struct Located {
     pub(crate) host: Host,
     /// The transcript file (Claude) or the newest thread file (Codex); for the label.
     pub(crate) transcript: PathBuf,
+    /// The host-assigned session id: the one the transcript's name carries, else a valid
+    /// supplied one for hosts without such names. Never a path.
+    pub(crate) session_id: Option<String>,
     /// Assistant messages, newest first, at most `options.pick`.
     pub(crate) messages: Vec<Message>,
+    /// How the transcript was chosen; the UI says so when nothing identified it exactly.
+    pub(crate) discovery: Discovery,
 }
 
 pub(crate) fn locate(options: &LastOptions) -> Result<Located> {
@@ -28,14 +34,19 @@ pub(crate) fn locate(options: &LastOptions) -> Result<Located> {
     };
     let pick = options.pick.max(1);
     let roots = Roots::from_env();
-    let (transcript, messages) = if let Some(path) = session {
-        readers::explicit(host, &path, options.session_id.as_deref(), pick)?
+    let (transcript, messages, discovery) = if let Some(path) = session {
+        // An id given next to a path is validated like any other before a reader sees it.
+        let supplied =
+            options.session_id.as_deref().map(plannotator_tui_hosts::validate_session_id).transpose()?;
+        let (transcript, messages) = readers::explicit(host, &path, supplied, pick)?;
+        (transcript, messages, Discovery::Exact)
     } else if let Some(id) = options.session_id.as_deref() {
         // Validation precedes cwd lookup and every resolver filesystem access.
         let id = plannotator_tui_hosts::validate_session_id(id)?;
         let cwd = agent_cwd()?;
         let exact = exact::resolve(host, id, &cwd, &roots)?;
-        readers::exact(host, id, exact, pick)?
+        let (transcript, messages) = readers::exact(host, id, exact, pick)?;
+        (transcript, messages, Discovery::Exact)
     } else {
         let cwd = agent_cwd()?;
         fallback::read(host, options, &cwd, &roots, pick)?
@@ -45,7 +56,18 @@ pub(crate) fn locate(options: &LastOptions) -> Result<Located> {
     if messages.is_empty() {
         bail!("transcript {} has no assistant messages yet", transcript.display());
     }
-    Ok(Located { host, transcript, messages })
+    let session_id = session_id_for(host, &transcript, options.session_id.as_deref());
+    Ok(Located { host, transcript, session_id, messages, discovery })
+}
+
+/// The id to record for a transcript. A transcript whose name carries its own id is the
+/// authority, so an id supplied next to a path cannot label the file as another session.
+/// Only hosts without such names (pi, omp, Hermes, `OpenCode`) take the supplied id, and only
+/// when it is shaped like one; anything else is left unknown rather than recorded wrong.
+fn session_id_for(host: Host, transcript: &Path, supplied: Option<&str>) -> Option<String> {
+    plannotator_tui_hosts::session_id_of(host, transcript).or_else(|| {
+        supplied.and_then(|id| plannotator_tui_hosts::validate_session_id(id).ok()).map(str::to_owned)
+    })
 }
 
 /// Was a host named explicitly, by flag or by the launcher?
@@ -119,4 +141,100 @@ pub(crate) fn screen_fallback(env: &crate::herdr::context::HerdrEnv) -> Option<D
         true,
         Provenance::AgentMessage { host, session: None, message_id: None },
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "tests assert by panicking")]
+mod tests {
+    use super::*;
+
+    /// One user turn and one assistant turn, the shape `claude::parse_messages` reads.
+    fn transcript(dir: &Path) -> PathBuf {
+        let path = dir.join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"type":"user","#,
+                r#""message":{"role":"user","content":"prompt"},"uuid":"u1","#,
+                r#""timestamp":"2026-08-28T10:00:00.000Z"}"#,
+                "\n",
+                r#"{"parentUuid":"u1","isSidechain":false,"type":"assistant","#,
+                r#""message":{"role":"assistant","content":[{"type":"text","text":"reply"}]},"#,
+                r#""uuid":"s1","timestamp":"2026-08-28T10:01:00.000Z"}"#,
+                "\n",
+            ),
+        )
+        .expect("transcript");
+        path
+    }
+
+    #[test]
+    fn a_transcript_without_an_id_in_its_name_keeps_a_valid_supplied_id() {
+        let dir = std::env::temp_dir().join(format!("plannotator locate keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let options = LastOptions {
+            host: Some("claude".to_owned()),
+            session: Some(transcript(&dir)),
+            session_id: Some("given-by-herdr".to_owned()),
+            pick: 25,
+            ..LastOptions::default()
+        };
+        let located = locate(&options).expect("the named transcript is read");
+        assert_eq!(located.session_id.as_deref(), Some("given-by-herdr"));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_transcript_named_on_the_command_line_is_never_reported_as_a_guess() {
+        let dir = std::env::temp_dir().join(format!("plannotator locate ü-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let options = LastOptions {
+            host: Some("claude".to_owned()),
+            session: Some(transcript(&dir)),
+            pick: 25,
+            ..LastOptions::default()
+        };
+
+        let located = locate(&options).expect("the named transcript is read");
+
+        assert_eq!(located.discovery, Discovery::Exact);
+        assert_eq!(located.messages.first().map(|m| m.text.as_str()), Some("reply"));
+        assert_eq!(located.session_id, None, "`session.jsonl` is not a session id");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn the_transcript_name_is_the_authority_over_a_supplied_id() {
+        let dir = std::env::temp_dir().join(format!("plannotator locate id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let id = "01a04583-a848-7b21-a890-f3ed0c9fef05";
+        let named = dir.join(format!("{id}.jsonl"));
+        std::fs::copy(transcript(&dir), &named).expect("copy");
+        let options = LastOptions {
+            host: Some("claude".to_owned()),
+            session: Some(named),
+            pick: 25,
+            ..LastOptions::default()
+        };
+
+        let located = locate(&options).expect("the named transcript is read");
+        assert_eq!(located.session_id.as_deref(), Some(id));
+
+        // An id that contradicts the file's own name must not relabel the file.
+        let other = LastOptions {
+            session_id: Some("22222222-2222-4222-8222-222222222222".to_owned()),
+            ..options.clone()
+        };
+        let located = locate(&other).expect("the named transcript is read");
+        assert_eq!(located.session_id.as_deref(), Some(id));
+
+        // A path-shaped id is rejected before any reader runs.
+        let bogus = LastOptions { session_id: Some("/etc/passwd".to_owned()), ..options };
+        let err = locate(&bogus).err().expect("a path is not a session id");
+        assert!(err.to_string().contains("invalid session id"), "{err:#}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 }

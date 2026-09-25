@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::{App, Focus, GUTTER, Geometry, Mode, TOOLBAR, glyph, label};
+use crate::theme::palette;
 use crate::wrap::wrap_line;
 
 const RAIL_WIDTH: u16 = 36;
@@ -21,12 +22,6 @@ const TREE_WIDTH: u16 = 28;
 /// Below this the tree is hidden unless toggled on; Tab still reaches it.
 pub(super) const TREE_MIN_TOTAL_WIDTH: u16 = 120;
 const COMPOSE_WIDTH: u16 = 48;
-
-pub(crate) const COMMENT_BG: Color = Color::Indexed(58);
-pub(crate) const APPROVE_BG: Color = Color::Indexed(22);
-const BLOCK_BG: Color = Color::Indexed(236);
-const TOOLBAR_BG: Color = Color::Indexed(238);
-const CURSOR_BG: Color = Color::Indexed(240);
 
 fn accent(kind: Kind) -> Color {
     match kind {
@@ -48,8 +43,12 @@ fn priority(kind: Kind) -> u8 {
 impl App {
     pub(crate) fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let [header, body, footer] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let [header, body, footer] = Layout::vertical([
+            Constraint::Length(self.header_height(area.width)),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         let show_tree = self.tree_shown(area.width) || (self.tree.is_some() && self.focus == Focus::Tree);
         let tree_width = if show_tree { TREE_WIDTH } else { 0 };
@@ -66,14 +65,7 @@ impl App {
             Constraint::Length(rail_width),
         ])
         .areas(body);
-        self.geometry = Geometry {
-            tree,
-            doc,
-            toolbar: None,
-            bubbles: Vec::new(),
-            send_button: None,
-            pick_rows: Vec::new(),
-        };
+        self.geometry = Geometry { tree, doc, ..Geometry::default() };
 
         if self.open.layout.width != usize::from(doc.width) {
             self.open.layout.reflow(usize::from(doc.width));
@@ -97,6 +89,8 @@ impl App {
             Mode::Edit(_) => self.draw_compose(frame, &self.compose_title("edit")),
             Mode::Browse if self.pending.is_some() => self.draw_toolbar(frame),
             Mode::Pick => self.draw_pick(frame),
+            Mode::Archive => self.draw_archive(frame),
+            Mode::ReviewMenu => self.draw_review_menu(frame),
             Mode::Browse | Mode::ConfirmQuit => {}
         }
     }
@@ -130,7 +124,7 @@ impl App {
                 if open_path == Some(row.path.as_path()) {
                     style = style.bold().fg(Color::Cyan);
                 }
-                let row_bg = (focused && i == self.tree_cursor).then_some(BLOCK_BG);
+                let row_bg = (focused && i == self.tree_cursor).then(|| palette().block_bg);
                 if let Some(bg) = row_bg {
                     style = style.bg(bg);
                 }
@@ -166,7 +160,7 @@ impl App {
             if block == self.selected && !text_selection_active && self.pending.is_none() && doc_focused {
                 buf.set_style(
                     Rect { x: doc.x, y: screen_y, width: doc.width, height: 1 },
-                    Style::new().bg(BLOCK_BG),
+                    Style::new().bg(palette().block_bg),
                 );
             }
 
@@ -181,8 +175,8 @@ impl App {
                 let Some(kind) = kind else { continue };
                 row_has_annotation = true;
                 let style = match kind {
-                    Kind::Comment => Style::new().bg(COMMENT_BG),
-                    Kind::LooksGood => Style::new().bg(APPROVE_BG),
+                    Kind::Comment => Style::new().bg(palette().comment_bg),
+                    Kind::LooksGood => Style::new().bg(palette().approve_bg),
                     Kind::Delete => {
                         Style::new().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT | Modifier::DIM)
                     }
@@ -195,14 +189,17 @@ impl App {
                 let end = cols.end.min(usize::from(doc.width)) as u16;
                 if end > start {
                     let rect = Rect { x: doc.x + start, y: screen_y, width: end - start, height: 1 };
-                    buf.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
+                    buf.set_style(rect, palette().selection);
                 }
             }
 
-            // Keyboard cursor, visible while selecting with the keyboard.
-            if doc_focused && self.selection.is_some_and(|s| s.dragging) && row_index == self.cursor.0 {
+            // Keyboard cursor, visible while roaming or selecting with the keyboard.
+            if doc_focused
+                && (self.roam || self.selection.is_some_and(|s| s.dragging))
+                && row_index == self.cursor.0
+            {
                 let x = doc.x + (self.cursor.1.min(usize::from(doc.width).saturating_sub(1))) as u16;
-                buf.set_style(Rect { x, y: screen_y, width: 1, height: 1 }, Style::new().bg(CURSOR_BG));
+                buf.set_style(Rect { x, y: screen_y, width: 1, height: 1 }, palette().cursor);
             }
 
             let marker = match (block == self.selected, row_has_annotation) {
@@ -242,12 +239,12 @@ impl App {
         let Some(rect) = self.float_origin(1, width) else { return };
         frame.render_widget(Clear, rect);
         let buf = frame.buffer_mut();
-        buf.set_style(rect, Style::new().bg(TOOLBAR_BG));
+        buf.set_style(rect, Style::new().bg(palette().toolbar_bg));
         let mut x = rect.x + 1;
         let mut spans = [0..0, 0..0, 0..0];
         for ((label, item), span) in labels.iter().zip(TOOLBAR.iter()).zip(spans.iter_mut()) {
             let w = label.width() as u16;
-            let style = Style::new().fg(accent(item.3)).bg(TOOLBAR_BG).bold();
+            let style = Style::new().fg(accent(item.3)).bg(palette().toolbar_bg).bold();
             buf.set_span(x, rect.y, &Span::styled(label.as_str(), style), w);
             *span = x..x + w;
             x += w;
@@ -345,8 +342,13 @@ impl App {
             let border =
                 if highlighted { Style::new().fg(accent(kind)) } else { Style::new().fg(Color::DarkGray) };
             let border = if rail_focused && index == self.rail_cursor { border.bold() } else { border };
+            let sent = if self.is_file_review() && !self.open.store.is_pending(placed.annotation) {
+                " · sent"
+            } else {
+                ""
+            };
             let title = Span::styled(
-                format!(" {} {} ", glyph(kind), short_id(&placed.annotation.id)),
+                format!(" {} {}{sent} ", glyph(kind), short_id(&placed.annotation.id)),
                 Style::new().fg(accent(kind)),
             );
             let bubble = Block::default()
@@ -367,7 +369,7 @@ impl App {
         self.geometry.bubbles = bubbles;
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+    fn draw_footer(&mut self, frame: &mut Frame, mut area: Rect) {
         if self.mode == Mode::ConfirmQuit {
             // The question owns the footer: the browse help would name keys that are not
             // live while it is up.
@@ -378,8 +380,19 @@ impl App {
             frame.render_widget(Paragraph::new(Line::from(Span::raw(question).bold())), area);
             return;
         }
+        if self.mode == Mode::Browse && !self.undo_archive.is_empty() {
+            let label = " U Undo finish ";
+            let width = (label.width() as u16).min(area.width);
+            let rect = Rect { x: area.right() - width, y: area.y, width, height: area.height };
+            frame.render_widget(Paragraph::new(label).style(Style::new().fg(Color::Cyan)), rect);
+            self.geometry.undo_button = Some(rect);
+            area.width = area.width.saturating_sub(width);
+        }
         let orphans = self.open.store.orphans();
-        let mut parts = vec![
+        // The status leads: it is the transient half of the line, and the name and counters
+        // it pushes right are on screen for the whole session anyway.
+        let mut parts: Vec<String> = self.status.iter().cloned().collect();
+        parts.extend([
             self.open.source.name.clone(),
             format!(
                 "{} annotations{}",
@@ -393,21 +406,25 @@ impl App {
                 }
                 None => format!("block {}/{}", self.selected + 1, self.open.doc.blocks.len()),
             },
-        ];
-        if let Some(status) = &self.status {
-            parts.push(status.clone());
-        }
+        ]);
         if frame.area().width < RAIL_MIN_TOTAL_WIDTH {
             parts.push("rail hidden: widen to ≥80 cols".into());
         }
+        // `S` is bound only in a reply review, so only a reply review names it.
+        let quit = if self.is_file_review() { "q quit " } else { "S send+quit · q quit " };
         let help = match self.focus {
-            _ if self.pending.is_some() => "a looks good · c comment · d delete · esc clear ",
-            Focus::Tree => "j/k · enter open · E send · t hide · q quit ",
-            Focus::Rail => "j/k · e edit · x remove · tab · q quit ",
-            Focus::Document => "drag or v select · c comment · E send · tab · q quit ",
+            _ if self.pending.is_some() => "a looks good · c comment · d delete · esc clear ".to_owned(),
+            Focus::Tree => "j/k · enter open · . hidden · E send · t hide · q quit ".to_owned(),
+            Focus::Rail => format!("j/k · e edit · x remove · tab · {quit}"),
+            Focus::Document if self.roam => format!("hjkl move · v select · c comment · esc blocks · {quit}"),
+            Focus::Document => format!("i move · v select · c comment · E send · tab · {quit}"),
         };
+        // The status must stay readable at any width, so the key help yields columns to it
+        // (and is clipped) rather than the other way round.
+        let status_width = self.status.as_ref().map_or(0, |s| s.width() + 1) as u16;
+        let help_width = (help.width() as u16).min(area.width.saturating_sub(status_width.max(10)));
         let [left_area, right_area] =
-            Layout::horizontal([Constraint::Min(10), Constraint::Length(help.width() as u16)]).areas(area);
+            Layout::horizontal([Constraint::Min(10), Constraint::Length(help_width)]).areas(area);
         frame.render_widget(
             Paragraph::new(Line::from(Span::raw(format!(" {}", parts.join(" · "))).dim())),
             left_area,

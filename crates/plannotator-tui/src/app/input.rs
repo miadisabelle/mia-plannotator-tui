@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
 };
 
 use super::compose::ComposeAction;
+use super::menu::ReviewAction;
 use super::selection::Selection;
 use super::send::SendState;
 use super::{App, Focus, GUTTER, Mode, Pending, TOOLBAR};
@@ -19,6 +20,11 @@ impl App {
                 Mode::Browse => self.browse_key(*key),
                 Mode::ConfirmQuit => self.confirm_quit_key(*key),
                 Mode::Pick => self.pick_key(*key),
+                Mode::Archive => {
+                    self.archive_key(*key);
+                    Ok(())
+                }
+                Mode::ReviewMenu => self.menu_key(*key),
                 Mode::Compose | Mode::Edit(_) => self.text_key(*key),
             },
             // A paste lands in the comment box verbatim, newlines included; anywhere else
@@ -29,6 +35,11 @@ impl App {
             }
             Event::Mouse(mouse) if self.mode == Mode::Browse => self.mouse(*mouse),
             Event::Mouse(mouse) if self.mode == Mode::Pick => self.pick_mouse(*mouse),
+            Event::Mouse(mouse) if self.mode == Mode::ReviewMenu => self.menu_mouse(*mouse),
+            Event::Mouse(mouse) if self.mode == Mode::Archive => {
+                self.archive_mouse(*mouse);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -45,6 +56,30 @@ impl App {
                 return Ok(());
             }
             (KeyCode::Char('E'), _) => return self.send_feedback(),
+            // A reply review sends every note, so one the agent already has closes like `q`.
+            (KeyCode::Char('S'), _) if !self.is_file_review() => {
+                if self.send_state == SendState::Sent {
+                    self.request_quit();
+                    return Ok(());
+                }
+                return self.send_and_quit();
+            }
+            (KeyCode::Char('m'), _) if self.is_file_review() => {
+                self.open_review_menu();
+                return Ok(());
+            }
+            (KeyCode::Char('R'), _) if self.is_file_review() => {
+                return self.run_review_action(ReviewAction::ResendAll);
+            }
+            (KeyCode::Char('F'), _) if self.is_file_review() => {
+                return self.run_review_action(ReviewAction::Finish);
+            }
+            (KeyCode::Char('U'), _) if self.is_file_review() => {
+                return self.run_review_action(ReviewAction::Undo);
+            }
+            (KeyCode::Char('H'), _) if self.is_file_review() => {
+                return self.run_review_action(ReviewAction::Archive);
+            }
             (KeyCode::Char('t'), _) => {
                 self.toggle_tree(self.geometry.doc.width + self.geometry.tree.width + GUTTER);
                 return Ok(());
@@ -68,9 +103,7 @@ impl App {
         match key.code {
             KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                 self.mode = Mode::Browse;
-                self.send_feedback()?;
-                // A refused send keeps the app open so the footer can say why.
-                self.quit = self.send_state == SendState::Sent;
+                self.send_and_quit()?;
             }
             KeyCode::Char('n' | 'N') => {
                 self.mode = Mode::Browse;
@@ -100,6 +133,7 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => self.tree_cursor = self.tree_cursor.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.open_tree_selection()?,
+            KeyCode::Char('.') => self.toggle_tree_hidden()?,
             KeyCode::Esc => self.focus = Focus::Document,
             _ => {}
         }
@@ -142,6 +176,18 @@ impl App {
             self.visual_key(key);
             return Ok(());
         }
+        // Roaming (`i`): the cursor moves with nothing selected yet, so `v` can start
+        // anywhere. Other keys fall through to their block-mode meaning.
+        if self.roam && self.selection.is_none() {
+            if key.code == KeyCode::Esc {
+                self.roam = false;
+                self.status = None;
+                return Ok(());
+            }
+            if self.motion_key(key) {
+                return Ok(());
+            }
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
                 if self.pending.is_some() || self.selection.is_some() {
@@ -155,12 +201,17 @@ impl App {
                 self.selection = Some(Selection::start(self.cursor));
                 self.status = Some("visual: move to extend, enter to select, esc to cancel".into());
             }
+            (KeyCode::Char('i'), _) => self.start_roaming(),
             (KeyCode::Char('j') | KeyCode::Down, _) => self.select_block(self.selected + 1),
             (KeyCode::Char('k') | KeyCode::Up, _) => self.select_block(self.selected.saturating_sub(1)),
-            (KeyCode::Char('h') | KeyCode::Left, _) => self.move_cursor(0, -1),
-            (KeyCode::Char('l') | KeyCode::Right, _) => self.move_cursor(0, 1),
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::PageDown, _) => self.scroll_by(page / 2),
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) | (KeyCode::PageUp, _) => self.scroll_by(-page / 2),
+            // A cursor that moves must be visible, so a column move in block mode is a
+            // roaming move: the same key, with the cursor drawn.
+            (KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right, _) => {
+                self.start_roaming();
+                self.motion_key(key);
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::PageDown, _) => self.page_by(page / 2),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) | (KeyCode::PageUp, _) => self.page_by(-page / 2),
             (KeyCode::Char('g') | KeyCode::Home, _) => self.select_block(0),
             (KeyCode::Char('G') | KeyCode::End, _) => {
                 self.select_block(self.open.doc.blocks.len().saturating_sub(1));
@@ -192,6 +243,25 @@ impl App {
         match key.code {
             KeyCode::Esc => self.clear_selection(),
             KeyCode::Enter | KeyCode::Char('v') => self.finish_selection(),
+            _ => {
+                self.motion_key(key);
+            }
+        }
+        if let Some(sel) = self.selection.as_mut() {
+            sel.set_head(self.cursor);
+        }
+    }
+
+    /// Enter roaming: the visual-mode motions move the cursor with nothing selected.
+    fn start_roaming(&mut self) {
+        self.clear_selection();
+        self.roam = true;
+        self.status = Some("move: hjkl w b 0 $ · v select · esc back to blocks".into());
+    }
+
+    /// The cursor motions shared by visual and roaming modes. True when `key` was one.
+    fn motion_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
             KeyCode::Char('h') | KeyCode::Left => self.move_cursor(0, -1),
             KeyCode::Char('l') | KeyCode::Right => self.move_cursor(0, 1),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1, 0),
@@ -203,12 +273,10 @@ impl App {
                 self.cursor.1 =
                     self.open.layout.row(self.cursor.0).map_or(0, |r| r.cells.len().saturating_sub(1));
             }
-            _ => {}
-        }
-        if let Some(sel) = self.selection.as_mut() {
-            sel.set_head(self.cursor);
+            _ => return false,
         }
         self.ensure_cursor_visible();
+        true
     }
 
     /// Move the keyboard cursor by rows/columns, skipping gap rows and clamping to text.
@@ -274,7 +342,12 @@ impl App {
                             self.status = Some("annotation updated".into());
                         }
                     }
-                    Mode::Compose | Mode::Browse | Mode::ConfirmQuit | Mode::Pick => {
+                    Mode::Compose
+                    | Mode::Browse
+                    | Mode::ConfirmQuit
+                    | Mode::Pick
+                    | Mode::Archive
+                    | Mode::ReviewMenu => {
                         if !body.is_empty()
                             && let Some(pending) = self.pending.take()
                         {
@@ -299,6 +372,17 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.send_button_hit(mouse.column, mouse.row) {
                     return self.send_feedback();
+                }
+                let hit = |rect: Option<ratatui::layout::Rect>| {
+                    rect.is_some_and(|r| mouse.row == r.y && mouse.column >= r.x && mouse.column < r.right())
+                };
+                if hit(self.geometry.review_button) {
+                    self.open_review_menu();
+                    return Ok(());
+                }
+                if hit(self.geometry.undo_button) {
+                    self.undo_finish_review();
+                    return Ok(());
                 }
                 if let Some(kind) = self.toolbar_hit(mouse.column, mouse.row) {
                     return self.act(kind);

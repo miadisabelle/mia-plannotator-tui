@@ -363,3 +363,16 @@ looked up in whichever table holds it. Verified against the `beta` source
 (`packages/core/src/session/sql.ts`, `packages/schema/src/session-message.ts`,
 `packages/util/src/global-roots.ts`) and a mixed-schema fixture reproducing the report.
 
+
+## 15. The cursor can roam before selecting (2026-09-18)
+
+Keyboard selection always anchored at the selected block's first row, because block mode
+had no row movement: commenting on the seventh bullet of a list meant the mouse. `i` now
+enters roaming: the visual-mode motions move the cursor with nothing selected, `v` anchors
+there, `Esc` (or any block key) returns to block mode.
+
+Two alternatives were rejected. A vim-style `o` that swaps anchor and head inside visual
+mode still forces the selection to start at the top and be shrunk from below. Splitting a
+top-level list into one block per item was built and dropped: it made `j`/`k` + `c` reach a
+bullet directly, but changed rendering (a block gap between every bullet) and the block
+model for everyone, when roaming already reaches any line.

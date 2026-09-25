@@ -1,19 +1,24 @@
 //! Application state. Input handling lives in `input`, drawing in `draw`; this module owns
 //! the data they share and the operations that change it.
 
+mod archive_view;
 mod compose;
 mod draw;
+mod feedback;
 mod header;
 mod input;
-
+mod menu;
 mod pick;
+mod replies;
+mod review;
+#[cfg(test)]
+mod review_test_support;
 mod selection;
 mod send;
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -23,7 +28,6 @@ use ratatui::layout::Rect;
 
 use crate::delivery::Delivery;
 use crate::doc::Document;
-use crate::export;
 use crate::layout::DocLayout;
 use crate::store::{Location, Store};
 use crate::tree::Tree;
@@ -52,6 +56,10 @@ enum Mode {
     ConfirmQuit,
     /// Choosing which of the agent's recent messages to review.
     Pick,
+    /// Restoring annotations from finished file reviews.
+    Archive,
+    /// The header's Review menu is open over a file or folder review.
+    ReviewMenu,
 }
 
 /// Which pane keyboard input goes to.
@@ -73,6 +81,13 @@ struct Geometry {
     bubbles: Vec<(Rect, String)>,
     /// The header's Send button; `None` when the header was too narrow for it.
     send_button: Option<Rect>,
+    /// The header's Review button; only file and folder reviews draw it.
+    review_button: Option<Rect>,
+    undo_button: Option<Rect>,
+    /// The Review menu drawn last frame and its rows, with their action index.
+    menu: Option<Rect>,
+    menu_rows: Vec<(Rect, usize)>,
+    archive_rows: Vec<(Rect, usize)>,
     /// Picker rows drawn last frame, with their candidate index.
     pick_rows: Vec<(Rect, usize)>,
 }
@@ -110,6 +125,7 @@ impl Open {
 
 use self::compose::Compose;
 
+#[allow(clippy::struct_excessive_bools, reason = "independent toggles, none of them a state machine")]
 pub(crate) struct App {
     open: Open,
     /// Where annotations are stored and how this folder is named there.
@@ -124,6 +140,14 @@ pub(crate) struct App {
     tree_visible: Option<bool>,
     delivery: Box<dyn Delivery>,
     send_state: SendState,
+    folder_counts: HashMap<PathBuf, feedback::ReviewCounts>,
+    /// Annotated files the folder counts could not read, in `review_files` order.
+    unreadable_files: Vec<PathBuf>,
+    undo_archive: Vec<review::ArchivedBatch>,
+    archive_items: Vec<review::ArchivedItem>,
+    archive_cursor: usize,
+    /// The highlighted row of the Review menu.
+    menu_cursor: usize,
     focus: Focus,
     scroll: usize,
     selected: usize,
@@ -131,6 +155,8 @@ pub(crate) struct App {
     pending: Option<Pending>,
     /// Keyboard cursor for visual selection, in document (row, col).
     cursor: (usize, usize),
+    /// `i`: the cursor moves by row without selecting, so `v` can start mid-block.
+    roam: bool,
     /// Index into the rail's placed annotations.
     rail_cursor: usize,
     mode: Mode,
@@ -148,7 +174,13 @@ pub(crate) struct App {
     /// rather than dropped.
     pick_cache: HashMap<usize, Open>,
     message_host: String,
+    /// The transcript path, for the archive's `transcript`; never the session id.
     message_transcript: String,
+    /// The host-assigned session id, for the archive's `session`; never a path.
+    message_session: Option<String>,
+    /// Set for a terminal review: the offsets of line breaks the wrapper inserted inside a
+    /// token. Feedback quotes rejoin them and carry no line labels.
+    terminal_breaks: Option<Vec<usize>>,
     compose: Compose,
     /// Whether the terminal reports Shift+Enter distinctly (kitty keyboard protocol).
     pub(super) shift_enter: bool,
@@ -192,12 +224,19 @@ impl App {
             tree_visible: None,
             delivery,
             send_state,
+            folder_counts: HashMap::new(),
+            unreadable_files: Vec::new(),
+            undo_archive: Vec::new(),
+            archive_items: Vec::new(),
+            archive_cursor: 0,
+            menu_cursor: 0,
             focus: Focus::Document,
             scroll: 0,
             selected: 0,
             selection: None,
             pending: None,
             cursor: (0, 0),
+            roam: false,
             rail_cursor: 0,
             mode: Mode::Browse,
             candidates: Vec::new(),
@@ -208,6 +247,8 @@ impl App {
             pick_cache: HashMap::new(),
             message_host: String::new(),
             message_transcript: String::new(),
+            message_session: None,
+            terminal_breaks: None,
             compose: Compose::default(),
             shift_enter: false,
             last_click: None,
@@ -243,10 +284,11 @@ impl App {
         if let Some(path) = &first {
             app.open = Open::new(read_file(path)?, width, &app.data_dir, &app.project)?;
         }
-        app.derive_send_state();
         app.refresh_counts(&mut tree);
         app.tree_cursor = first.as_deref().and_then(|p| tree.position(p)).unwrap_or(0);
         app.tree = Some(tree);
+        app.refresh_review_counts();
+        app.derive_send_state();
         Ok(app)
     }
 
@@ -277,6 +319,29 @@ impl App {
         }
     }
 
+    /// Show or hide dot-prefixed entries in the tree. A view choice only: annotations
+    /// recorded for a file inside a hidden folder are part of the review either way, so
+    /// what `E` sends and what the review counts add up to do not change here.
+    fn toggle_tree_hidden(&mut self) -> Result<()> {
+        let Some(mut tree) = self.tree.take() else { return Ok(()) };
+        let selected = tree.rows.get(self.tree_cursor).map(|r| r.path.clone());
+        let result = tree.set_show_hidden(!tree.show_hidden());
+        self.refresh_counts(&mut tree);
+        self.status = Some(
+            if tree.show_hidden() { "hidden entries shown" } else { "hidden entries hidden" }.to_owned(),
+        );
+        // Keep the cursor on the same row where the relist still lists it.
+        self.tree_cursor = selected
+            .and_then(|path| tree.position(&path))
+            .unwrap_or_else(|| self.tree_cursor.min(tree.rows.len().saturating_sub(1)));
+        self.tree = Some(tree);
+        result?;
+        self.refresh_review_counts();
+        self.derive_send_state();
+        self.keep_tree_cursor_visible(usize::from(self.geometry.tree.height));
+        Ok(())
+    }
+
     /// Open the file under the tree cursor, or expand/collapse a directory.
     fn open_tree_selection(&mut self) -> Result<()> {
         let Some(row) = self.tree.as_ref().and_then(|t| t.rows.get(self.tree_cursor)) else { return Ok(()) };
@@ -286,6 +351,8 @@ impl App {
                 self.refresh_counts(&mut tree);
                 self.tree = Some(tree);
                 result?;
+                self.refresh_review_counts();
+                self.derive_send_state();
             }
             return Ok(());
         }
@@ -296,6 +363,7 @@ impl App {
         }
         let width = self.open.layout.width;
         self.open = Open::new(read_file(&path)?, width, &self.data_dir, &self.project)?;
+        self.update_open_review_counts();
         self.derive_send_state();
         self.scroll = 0;
         self.selected = 0;
@@ -308,6 +376,11 @@ impl App {
 
     pub(crate) fn set_status(&mut self, status: String) {
         self.status = Some(status);
+    }
+
+    /// Mark this as a terminal review whose wrapper broke tokens at `breaks` (sorted).
+    pub(crate) fn set_terminal_breaks(&mut self, breaks: Vec<usize>) {
+        self.terminal_breaks = Some(breaks);
     }
 
     pub(crate) fn record_frame(&mut self, ms: f64) {
@@ -362,95 +435,6 @@ impl App {
         Ok(())
     }
 
-    /// The feedback document for every placed annotation of the open file.
-    pub(crate) fn feedback(&self) -> String {
-        Self::feedback_for(&self.open, &self.open.source.name)
-    }
-
-    fn feedback_for(open: &Open, name: &str) -> String {
-        let source = &open.doc.source;
-        let entries: Vec<export::Entry<'_>> = open
-            .store
-            .placed()
-            .into_iter()
-            .map(|p| export::Entry {
-                annotation: p.annotation,
-                lines: export::line_span(source, p.range),
-                range: p.range.clone(),
-            })
-            .collect();
-        export::feedback(source, name, &entries)
-    }
-
-    /// Feedback for every annotated file in the folder, one `# Annotations on <path>` block each.
-    pub(crate) fn folder_feedback(&self) -> Result<String> {
-        let Some(tree) = &self.tree else { return Ok(self.feedback()) };
-        let width = self.open.layout.width;
-        let mut out = String::new();
-        for path in self.annotated_files() {
-            let open = Open::new(read_file(&path)?, width, &self.data_dir, &self.project)?;
-            let relative = path.strip_prefix(tree.root()).unwrap_or(&path);
-            let _ = writeln!(out, "{}", Self::feedback_for(&open, &relative.display().to_string()));
-        }
-        Ok(if out.is_empty() { "No annotations.".to_owned() } else { out })
-    }
-
-    /// Paths of every annotated file in the folder: the project's records (which carry their
-    /// document path since 0.5.0) plus any listed tree row with a count, so nothing depends
-    /// on which directories happen to be expanded.
-    fn annotated_files(&self) -> Vec<PathBuf> {
-        let Some(tree) = &self.tree else { return Vec::new() };
-        let mut found = Store::annotated_documents(&self.data_dir, &self.project);
-        for row in tree.rows.iter().filter(|r| !r.is_dir && r.annotations > 0) {
-            found.push(row.path.clone());
-        }
-        found.sort();
-        found.dedup();
-        found.retain(|p| p.is_file());
-        found
-    }
-
-    fn is_open(&self, path: &Path) -> bool {
-        matches!(&self.open.source.provenance, Provenance::File { path: p } if p == path)
-    }
-
-    /// Remember the send on every file it covered: the open one in memory, the rest on disk.
-    fn record_delivery(&mut self, target: &str) -> Result<()> {
-        if self.tree.is_none() {
-            return self.open.store.record_delivery(target);
-        }
-        let width = self.open.layout.width;
-        for path in self.annotated_files() {
-            if self.is_open(&path) {
-                self.open.store.record_delivery(target)?;
-            } else {
-                let mut open = Open::new(read_file(&path)?, width, &self.data_dir, &self.project)?;
-                open.store.record_delivery(target)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// True when every annotated file in the folder has been sent since it last changed.
-    fn folder_all_delivered(&self) -> Result<bool> {
-        let files = self.annotated_files();
-        if files.is_empty() {
-            return Ok(false);
-        }
-        let width = self.open.layout.width;
-        for path in files {
-            let delivered = if self.is_open(&path) {
-                self.open.store.all_delivered()
-            } else {
-                Open::new(read_file(&path)?, width, &self.data_dir, &self.project)?.store.all_delivered()
-            };
-            if !delivered {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     fn clear_selection(&mut self) {
         self.selection = None;
         self.pending = None;
@@ -461,6 +445,7 @@ impl App {
             return;
         }
         self.clear_selection();
+        self.roam = false;
         self.selected = block.min(self.open.doc.blocks.len() - 1);
         if let Some(rendered) = self.open.layout.blocks.get(self.selected) {
             self.cursor = (rendered.first_row, 0);
@@ -493,6 +478,45 @@ impl App {
         let height = usize::from(self.geometry.doc.height.max(1));
         let max = self.open.layout.total_rows.saturating_sub(height);
         self.scroll = (self.scroll as i64 + delta).clamp(0, max as i64) as usize;
+    }
+
+    /// Page the document the way vim's ctrl+d / ctrl+u do: the selection moves as far as
+    /// the view, so the next block key continues from what is on screen. The mouse wheel
+    /// keeps `scroll_by`, which moves the view alone.
+    fn page_by(&mut self, delta: i64) {
+        if delta == 0 {
+            // A one-row pane pages by nothing; leave the selection where it is.
+            return;
+        }
+        let before = self.scroll;
+        self.scroll_by(delta);
+        if self.scroll == before {
+            // Already at an edge: select the edge block, as vim puts the cursor there.
+            let edge = if delta > 0 { self.open.doc.blocks.len().saturating_sub(1) } else { 0 };
+            self.select_block(edge);
+            return;
+        }
+        let blocks = &self.open.layout.blocks;
+        let Some(from) = blocks.get(self.selected).map(|b| b.first_row) else { return };
+        let height = usize::from(self.geometry.doc.height.max(1));
+        let view = self.scroll..self.scroll + height;
+        let target = (from as i64 + delta).clamp(view.start as i64, view.end as i64 - 1) as usize;
+        // The block that owns the target row, or the next one when the target is a gap row.
+        // A tall block that starts above the view still counts while any of it is on screen.
+        let on_screen = |b: &crate::layout::RenderedBlock| {
+            b.first_row < view.end && b.first_row + b.rows.len().max(1) > view.start
+        };
+        let owner = blocks.partition_point(|b| b.first_row <= target);
+        let block = match owner.checked_sub(1) {
+            Some(i) if blocks.get(i).is_some_and(|b| b.first_row + b.rows.len().max(1) > target) => i,
+            _ => owner,
+        };
+        if blocks.get(block).is_some_and(on_screen) {
+            let scroll = self.scroll;
+            self.select_block(block);
+            // select_block may nudge the view to fit a tall block; the page owns it here.
+            self.scroll = scroll;
+        }
     }
 
     fn tree_len(&self) -> usize {
@@ -529,10 +553,18 @@ impl App {
         self.open.source = read_file(&path)?;
         self.open.doc = Document::parse(self.open.source.content.clone());
         self.open.layout = DocLayout::build(&self.open.doc, self.open.layout.width);
-        self.open.store.resolve_all(&self.open.doc);
+        self.open.store =
+            Store::load(&Location::for_file(&self.data_dir, &self.project, &path), &self.open.doc)?;
+        self.refresh_review_counts();
+        self.derive_send_state();
+        self.sync_tree_counts();
         self.clear_selection();
         self.selected = self.selected.min(self.open.doc.blocks.len().saturating_sub(1));
-        self.status = Some(format!("reloaded · {} orphaned", self.open.store.orphans()));
+        let mut status = format!("reloaded · {} orphaned", self.open.store.orphans());
+        if let Some(note) = self.unreadable_note() {
+            status = format!("{status} · {note}");
+        }
+        self.status = Some(status);
         Ok(())
     }
 
@@ -547,9 +579,15 @@ impl App {
         self.annotate(range, kind, body)
     }
 
+    /// Annotate the first occurrence of `quote` in the source.
+    #[cfg(test)]
+    pub(crate) fn add_quote_annotation(&mut self, quote: &str, kind: Kind, body: String) -> Result<()> {
+        self.add_quote_annotation_at(quote, 1, kind, body)
+    }
+
     /// Annotate the `occurrence`-th (1-based) occurrence of `quote` in the source, counting
     /// non-overlapping matches.
-    pub(crate) fn add_quote_annotation(
+    pub(crate) fn add_quote_annotation_at(
         &mut self,
         quote: &str,
         occurrence: usize,

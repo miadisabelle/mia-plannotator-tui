@@ -7,12 +7,26 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use plannotator_tui_hosts::copilot;
-use plannotator_tui_hosts::{Host, Message, claude, droid, opencode, pi};
+use plannotator_tui_hosts::{Host, Match, Message, claude, droid, opencode, pi};
 
 use super::LastOptions;
 use super::exact;
 use super::readers;
 use super::roots::Roots;
+
+/// How a transcript was chosen, so the UI can say when nothing identified it exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Discovery {
+    /// An explicit path, an exact session id, a thread id, the session registered for the
+    /// agent's pid, or the file the agent process itself has open: this transcript is the
+    /// session, not a guess.
+    Exact,
+    /// The newest transcript filed under the agent's working directory. Sessions that share
+    /// one directory are indistinguishable here.
+    Folder,
+    /// The newest session the host recorded, not scoped to a directory.
+    Session,
+}
 
 pub(super) fn read(
     host: Host,
@@ -20,31 +34,39 @@ pub(super) fn read(
     cwd: &Path,
     roots: &Roots,
     pick: usize,
-) -> Result<(PathBuf, Vec<Message>)> {
+) -> Result<(PathBuf, Vec<Message>, Discovery)> {
     match host {
         Host::ClaudeCode => {
-            let path = find_claude_transcript(options.pid, cwd, roots)?;
+            let (path, rung) = find_claude_transcript(options.pid, cwd, roots)?;
             let messages = readers::claude_messages(&path, pick)?;
-            Ok((path, messages))
+            Ok((path, messages, discovery_of(rung)))
         }
         Host::Codex => {
+            #[cfg(target_os = "linux")]
+            if let Some(pid) = options.pid {
+                let path = find_codex_transcript(pid)?;
+                let (path, messages) = readers::explicit(host, &path, None, pick)?;
+                return Ok((path, messages, Discovery::Exact));
+            }
             let thread = std::env::var("CODEX_THREAD_ID").ok().filter(|thread| !thread.is_empty());
-            readers::codex_thread(&roots.codex_home, thread.as_deref(), pick)
+            let discovery = if thread.is_some() { Discovery::Exact } else { Discovery::Session };
+            let (path, messages) = readers::codex_thread(&roots.codex_home, thread.as_deref(), pick)?;
+            Ok((path, messages, discovery))
         }
         Host::Copilot => {
-            let path = find_copilot_session(options.pid, cwd, roots)?;
+            let (path, rung) = find_copilot_session(options.pid, cwd, roots)?;
             let messages = readers::copilot_messages(&path, pick)?;
-            Ok((path, messages))
+            Ok((path, messages, discovery_of(rung)))
         }
         Host::Droid => {
             let path = find_droid_transcript(cwd, roots)?;
             let messages = readers::droid_messages(&path, pick)?;
-            Ok((path, messages))
+            Ok((path, messages, Discovery::Folder))
         }
         Host::Pi => {
             let path = find_pi_transcript(cwd, roots, ".pi/agent", "pi")?;
             let messages = readers::pi_messages(&path, pick)?;
-            Ok((path, messages))
+            Ok((path, messages, Discovery::Folder))
         }
         Host::Omp => bail!(
             "OMP session discovery without an exact path or id is unsupported; pass --session or --session-id"
@@ -54,7 +76,51 @@ pub(super) fn read(
     }
 }
 
-fn find_claude_transcript(pid: Option<u32>, cwd: &Path, roots: &Roots) -> Result<PathBuf> {
+/// What a resolver's rung means for the footer: a session registered for the agent's pid
+/// is the session; a cwd or folder rung is the folder's newest transcript; an unscoped
+/// rung is just the newest session the host has.
+fn discovery_of(rung: Match) -> Discovery {
+    match rung {
+        Match::Session => Discovery::Exact,
+        Match::Cwd | Match::Folder => Discovery::Folder,
+        Match::Newest => Discovery::Session,
+    }
+}
+
+/// A selected Linux process is a stronger hint than an inherited thread id or the newest
+/// rollout. Missing or ambiguous descriptors must not silently select another session.
+/// Codex keeps its subagents' rollouts (reviews, guardians) open too; those are ignored.
+#[cfg(target_os = "linux")]
+fn find_codex_transcript(pid: u32) -> Result<PathBuf> {
+    let directory = PathBuf::from(format!("/proc/{pid}/fd"));
+    let entries = std::fs::read_dir(&directory)
+        .with_context(|| format!("reading Codex process {pid} descriptors in {}", directory.display()))?;
+    let mut transcripts = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", directory.display()))?;
+        // Descriptors can close between readdir and readlink.
+        let Ok(path) = std::fs::read_link(entry.path()) else { continue };
+        if path.extension().is_some_and(|extension| extension == "jsonl")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-"))
+            && path.is_file()
+            && !plannotator_tui_hosts::codex::is_subagent(&path)
+        {
+            transcripts.insert(path);
+        }
+    }
+    if transcripts.len() != 1 {
+        bail!(
+            "Codex process {pid} has {} open transcripts; pass --session or --session-id to select one",
+            transcripts.len()
+        );
+    }
+    transcripts.into_iter().next().with_context(|| format!("no transcript for Codex process {pid}"))
+}
+
+fn find_claude_transcript(pid: Option<u32>, cwd: &Path, roots: &Roots) -> Result<(PathBuf, Match)> {
     let sessions_dir = roots.claude_config.join("sessions");
     let projects_dir = roots.claude_config.join("projects");
     let (start_pid, table) = process_context(pid);
@@ -68,7 +134,7 @@ fn find_claude_transcript(pid: Option<u32>, cwd: &Path, roots: &Roots) -> Result
 }
 
 #[cfg(unix)]
-fn find_copilot_session(pid: Option<u32>, cwd: &Path, roots: &Roots) -> Result<PathBuf> {
+fn find_copilot_session(pid: Option<u32>, cwd: &Path, roots: &Roots) -> Result<(PathBuf, Match)> {
     let (start_pid, table) = process_context(pid);
     copilot::find_session(&roots.copilot_home, cwd, &table, start_pid, is_copilot_process).ok_or_else(|| {
         anyhow::anyhow!(
@@ -80,7 +146,7 @@ fn find_copilot_session(pid: Option<u32>, cwd: &Path, roots: &Roots) -> Result<P
 }
 
 #[cfg(not(unix))]
-fn find_copilot_session(_pid: Option<u32>, _cwd: &Path, _roots: &Roots) -> Result<PathBuf> {
+fn find_copilot_session(_pid: Option<u32>, _cwd: &Path, _roots: &Roots) -> Result<(PathBuf, Match)> {
     bail!("Copilot session discovery without --session-id is unsupported on Windows; pass --session-id")
 }
 
@@ -135,7 +201,7 @@ fn process_table() -> Vec<(u32, u32)> {
         .unwrap_or_default()
 }
 
-fn opencode_for_cwd(cwd: &Path, roots: &Roots, pick: usize) -> Result<(PathBuf, Vec<Message>)> {
+fn opencode_for_cwd(cwd: &Path, roots: &Roots, pick: usize) -> Result<(PathBuf, Vec<Message>, Discovery)> {
     let databases = roots.opencode_databases();
     let mut best: Option<(PathBuf, opencode::Found)> = None;
     for database in &databases {
@@ -149,5 +215,18 @@ fn opencode_for_cwd(cwd: &Path, roots: &Roots, pick: usize) -> Result<(PathBuf, 
         format!("no OpenCode session for {} in {}", cwd.display(), exact::describe(&databases))
     })?;
     let messages = opencode::messages_for_session(&database, &found.id, found.schema, pick)?;
-    Ok((database, messages))
+    Ok((database, messages, Discovery::Folder))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_pid_registered_session_counts_as_exact() {
+        assert_eq!(discovery_of(Match::Session), Discovery::Exact);
+        assert_eq!(discovery_of(Match::Cwd), Discovery::Folder);
+        assert_eq!(discovery_of(Match::Folder), Discovery::Folder);
+        assert_eq!(discovery_of(Match::Newest), Discovery::Session);
+    }
 }

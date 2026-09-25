@@ -17,6 +17,8 @@ pub(crate) struct OpenArgs {
     pub(crate) path: Option<PathBuf>,
     pub(crate) placement: Option<Placement>,
     pub(crate) deliver_to: Option<String>,
+    /// `last` only: open the newest reply without offering the picker first.
+    pub(crate) newest: bool,
 }
 
 /// A fully resolved launch.
@@ -39,6 +41,17 @@ pub(crate) struct Launch {
     pub(crate) message: Option<AgentMessage>,
     /// The agent's session as Herdr reports it: a transcript path or a host-specific id.
     pub(crate) session: Option<AgentSession>,
+    /// Open the newest reply straight away instead of showing the picker.
+    pub(crate) newest: bool,
+    /// Open a pane's recent terminal output instead of `file`.
+    pub(crate) terminal: Option<TerminalRead>,
+}
+
+/// Which pane's output the opened pane reads, and how much of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalRead {
+    pub(crate) pane: String,
+    pub(crate) lines: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +139,9 @@ pub(crate) fn plan_last(
     process_info_json: Option<&str>,
     agent_get_json: Option<&str>,
 ) -> Result<Launch> {
+    let newest = args.newest;
     let mut launch = plan(env, config, OpenArgs { path: None, ..args }, cwd)?;
+    launch.newest = newest;
     let pane = launch.deliver.as_ref().map(|t| t.pane.clone()).or_else(|| launch.target_pane.clone());
     let Some(pane) = pane else {
         anyhow::bail!("no agent pane to read: not focused on one and no --deliver-to")
@@ -144,6 +159,24 @@ pub(crate) fn plan_last(
     };
     let host = agent_get_json.and_then(agent_host).unwrap_or(&process_host).to_owned();
     launch.message = Some(AgentMessage { host, pid: Some(pid) });
+    Ok(launch)
+}
+
+/// Resolve a `terminal` launch: the reviewed pane's output opens in the doc pane, and feedback
+/// goes where it would for `last` — the focused pane when an agent runs there, or
+/// `--deliver-to` — else to the clipboard.
+pub(crate) fn plan_terminal(
+    env: &HerdrEnv,
+    config: &Config,
+    args: OpenArgs,
+    cwd: &Path,
+    read: TerminalRead,
+) -> Result<Launch> {
+    let mut launch = plan(env, config, OpenArgs { path: None, newest: false, ..args }, cwd)?;
+    launch.file.clone_from(&launch.cwd);
+    // A split opens beside the pane being reviewed, whoever receives the feedback.
+    launch.target_pane = Some(read.pane.clone());
+    launch.terminal = Some(read);
     Ok(launch)
 }
 
@@ -194,6 +227,15 @@ pub(crate) fn plan(env: &HerdrEnv, config: &Config, args: OpenArgs, cwd: &Path) 
     let placement = match (args.placement, env.placement.as_deref()) {
         (Some(p), _) => p,
         (None, Some(text)) => text.parse().context("PLANNOTATOR_TUI_PLACEMENT")?,
+        // Mirror imports ordinary panes, not the remote client's overlays. Herdr
+        // 0.8.2 also places overlays in its globally active tab, which may differ
+        // from the invoking mirror. A targeted split reaches the intended tab.
+        (None, None)
+            if config.herdr.placement == Placement::Overlay
+                && context.and_then(|c| c.invocation_source.as_deref()) == Some("mirror") =>
+        {
+            Placement::Split
+        }
         (None, None) => config.herdr.placement,
     };
 
@@ -232,9 +274,11 @@ pub(crate) fn plan(env: &HerdrEnv, config: &Config, args: OpenArgs, cwd: &Path) 
         popup: (config.herdr.popup_width.clone(), config.herdr.popup_height.clone()),
         target_pane,
         deliver,
-        plugin: env.plugin_id.clone().unwrap_or_else(|| "plannotator-tui".to_owned()),
+        plugin: env.plugin_id.clone().unwrap_or_else(|| "annotate".to_owned()),
         message: None,
         session: None,
+        newest: false,
+        terminal: None,
     })
 }
 
@@ -260,12 +304,19 @@ pub(crate) fn argv(launch: &Launch) -> Vec<String> {
     }
     out.push("--focus".to_owned());
     out.extend(["--cwd".to_owned(), launch.cwd.display().to_string()]);
-    match &launch.message {
-        Some(message) => {
+    match (&launch.message, &launch.terminal) {
+        (_, Some(terminal)) => {
+            out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_TERMINAL_PANE={}", terminal.pane)]);
+            out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_TERMINAL_LINES={}", terminal.lines)]);
+        }
+        (Some(message), None) => {
             if let Some(pid) = message.pid {
                 out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_MESSAGE_PID={pid}")]);
             }
             out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_HOST={}", message.host)]);
+            if launch.newest {
+                out.extend(["--env".to_owned(), "PLANNOTATOR_TUI_NEWEST=1".to_owned()]);
+            }
             out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_CWD={}", launch.cwd.display())]);
             match &launch.session {
                 Some(AgentSession::Path(p)) => {
@@ -277,7 +328,9 @@ pub(crate) fn argv(launch: &Launch) -> Vec<String> {
                 None => {}
             }
         }
-        None => out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_FILE={}", launch.file.display())]),
+        (None, None) => {
+            out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_FILE={}", launch.file.display())]);
+        }
     }
     if let Some(target) = &launch.deliver {
         out.extend(["--env".to_owned(), format!("PLANNOTATOR_TUI_DELIVER_TO={}", target.pane)]);
