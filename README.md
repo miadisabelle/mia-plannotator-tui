@@ -176,6 +176,16 @@ its path: Plannotator's own layout, so both tools see one record per file. The J
 Plannotator Workspaces wire shape; any agent can read it. Nothing is written next to your
 files. `PLANNOTATOR_DATA_DIR` relocates the directory.
 
+### Who a mark is by
+
+A mark is anonymous unless whoever started the process names its author. Set
+`PLANNOTATOR_TUI_AUTHOR` (a stable id) and `PLANNOTATOR_TUI_AUTHOR_NAME` (a readable name),
+both or neither, and every mark made in that process carries them as `author` and
+`author_name`; the status line says `comment saved as <name>`. `PLANNOTATOR_TUI_AUTHOR_BASIS`
+records how the caller knows, as `author_basis` beside `author_by` and `author_by_name`. This
+tool verifies none of it: the names are the caller's word. Existing marks keep the author they
+were written with.
+
 ### Feedback archive
 
 A successful Send or Copy also appends what was submitted (the feedback text, the quoted

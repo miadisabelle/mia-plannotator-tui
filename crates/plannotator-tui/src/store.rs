@@ -16,11 +16,60 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use plannotator_tui_schema::{Anchor, Annotation, Kind, Resolution, State, resolve};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::doc::Document;
 
 mod review;
 use review::timestamp;
+
+/// Who the marks made in this process are by, named by whoever started it.
+///
+/// A label the caller vouches for, as `Annotation::author` says: this crate verifies nothing.
+/// `PLANNOTATOR_TUI_AUTHOR` is a stable id and `PLANNOTATOR_TUI_AUTHOR_NAME` a readable name.
+/// `PLANNOTATOR_TUI_AUTHOR_BASIS` is the caller's word for how it knows, recorded with the
+/// mark as `author_basis` beside `author_by` / `author_by_name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Author {
+    id: String,
+    name: String,
+    basis: Option<String>,
+}
+
+impl Author {
+    /// Both names or nothing: a value that is too long or holds a control character is not used.
+    pub(crate) fn new(id: Option<&str>, name: Option<&str>, basis: Option<&str>) -> Option<Self> {
+        let usable = |value: &str, max: usize| {
+            !value.is_empty() && value.chars().count() <= max && !value.chars().any(char::is_control)
+        };
+        let (id, name) = (id?.trim(), name?.trim());
+        if !usable(id, 120) || !usable(name, 80) {
+            return None;
+        }
+        let basis = basis.map(str::trim).filter(|b| usable(b, 40)).map(str::to_owned);
+        Some(Self { id: id.to_owned(), name: name.to_owned(), basis })
+    }
+
+    pub(crate) fn from_env() -> Option<Self> {
+        let var = |key| std::env::var(key).ok();
+        let (id, name, basis) = (
+            var("PLANNOTATOR_TUI_AUTHOR"),
+            var("PLANNOTATOR_TUI_AUTHOR_NAME"),
+            var("PLANNOTATOR_TUI_AUTHOR_BASIS"),
+        );
+        Self::new(id.as_deref(), name.as_deref(), basis.as_deref())
+    }
+
+    /// The fields beside `author` / `author_name` on the record.
+    fn attribution(&self) -> std::collections::BTreeMap<String, Value> {
+        let Some(basis) = &self.basis else { return std::collections::BTreeMap::default() };
+        std::collections::BTreeMap::from([
+            ("author_basis".to_owned(), Value::String(basis.clone())),
+            ("author_by".to_owned(), Value::String(self.id.clone())),
+            ("author_by_name".to_owned(), Value::String(self.name.clone())),
+        ])
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
@@ -33,6 +82,8 @@ pub(crate) struct Store {
     resolved: Vec<Resolution>,
     deliveries: Vec<Delivered>,
     archived: Vec<Annotation>,
+    /// Who a new mark is by; `None` leaves it anonymous.
+    author: Option<Author>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -131,6 +182,7 @@ impl Store {
             resolved: Vec::new(),
             deliveries: record.deliveries,
             archived: record.archived,
+            author: Author::from_env(),
         };
         store.resolve_all(doc);
         if imported && !store.annotations.is_empty() {
@@ -151,7 +203,13 @@ impl Store {
             resolved: Vec::new(),
             deliveries: Vec::new(),
             archived: Vec::new(),
+            author: None,
         }
+    }
+
+    /// The name new marks carry, for the status line.
+    pub(crate) fn author_name(&self) -> Option<&str> {
+        self.author.as_ref().map(|a| a.name.as_str())
     }
 
     /// True when nothing about this store ever reaches disk.
@@ -227,14 +285,14 @@ impl Store {
             document_id: String::new(),
             anchor,
             body,
-            author: None,
-            author_name: None,
+            author: self.author.as_ref().map(|a| a.id.clone()),
+            author_name: self.author.as_ref().map(|a| a.name.clone()),
             state: State::Open,
             attachments: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
             replies: Vec::new(),
-            other: std::collections::BTreeMap::default(),
+            other: self.author.as_ref().map(Author::attribution).unwrap_or_default(),
         });
         self.resolved.push(Resolution::Range(range));
         self.save()
@@ -341,6 +399,48 @@ mod tests {
     }
 
     #[test]
+    fn author_needs_both_names_and_refuses_what_a_record_should_not_hold() {
+        let ok =
+            Author::new(Some("node:human:1:a"), Some(" Guillaume "), Some("signed")).expect("both named");
+        assert_eq!(ok.name, "Guillaume");
+        assert_eq!(ok.basis.as_deref(), Some("signed"));
+        assert_eq!(Author::new(Some("id"), None, None), None);
+        assert_eq!(Author::new(None, Some("name"), None), None);
+        assert_eq!(Author::new(Some("  "), Some("name"), None), None);
+        assert_eq!(Author::new(Some("id"), Some("a\u{1b}[31mb"), None), None);
+        assert_eq!(Author::new(Some(&"x".repeat(121)), Some("name"), None), None);
+        assert_eq!(Author::new(Some("id"), Some(&"x".repeat(81)), None), None);
+        let unusable_basis = Author::new(Some("id"), Some("name"), Some("a\nb")).expect("still named");
+        assert_eq!(unusable_basis.basis, None);
+    }
+
+    #[test]
+    fn a_mark_carries_its_author_on_disk_and_an_older_mark_keeps_having_none() {
+        let root = temp_root("author");
+        let location = Location::for_file(&root.join("data"), "proj", &root.join("doc.md"));
+        let doc = Document::parse("# A\n\nfirst\n\nsecond\n".to_owned());
+
+        let mut anonymous = Store::load(&location, &doc).expect("empty");
+        anonymous.author = None;
+        anonymous.add(&doc, 5..10, "first".into(), Kind::Comment, "by nobody".into()).expect("saved");
+
+        let mut signed = Store::load(&location, &doc).expect("reload");
+        signed.author = Author::new(Some("node:human:1:a"), Some("Guillaume"), Some("signed"));
+        assert_eq!(signed.author_name(), Some("Guillaume"));
+        signed.add(&doc, 12..18, "second".into(), Kind::Comment, "by Guillaume".into()).expect("saved");
+
+        let record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&location.record).expect("record")).expect("json");
+        let marks = record.get("annotations").and_then(Value::as_array).expect("annotations");
+        assert_eq!(marks[0].get("author"), Some(&Value::Null), "nothing assigns an author after the fact");
+        assert_eq!(marks[1].get("author").and_then(Value::as_str), Some("node:human:1:a"));
+        assert_eq!(marks[1].get("author_name").and_then(Value::as_str), Some("Guillaume"));
+        assert_eq!(marks[1].get("author_basis").and_then(Value::as_str), Some("signed"));
+        assert_eq!(marks[1].get("author_by").and_then(Value::as_str), Some("node:human:1:a"));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn saves_on_every_change_and_re_resolves_after_an_edit() {
         let root = temp_root("save");
         let data_dir = root.join("data");
@@ -380,6 +480,7 @@ mod tests {
             resolved: Vec::new(),
             deliveries: Vec::new(),
             archived: Vec::new(),
+            author: None,
         };
         seed.add(&doc, 0..5, "hello".into(), Kind::Comment, "hi".into()).expect("seed sidecar");
         let before = std::fs::read_to_string(&sidecar).expect("sidecar");

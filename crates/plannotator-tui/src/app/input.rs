@@ -352,7 +352,10 @@ impl App {
                             && let Some(pending) = self.pending.take()
                         {
                             self.annotate(pending.range, Kind::Comment, body)?;
-                            self.status = Some("comment saved".into());
+                            self.status = Some(match self.open.store.author_name() {
+                                Some(name) => format!("comment saved as {name}"),
+                                None => "comment saved".into(),
+                            });
                         }
                         self.clear_selection();
                     }
